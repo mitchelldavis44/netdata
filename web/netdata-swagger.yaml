@@ -2,8 +2,8 @@ swagger: '2.0'
 info:
   title: NetData API
   description: 'Real time data collection and graphs...'
-  version: 1.2.1_master
-host: netdata.firehol.org
+  version: 1.5.1_rolling
+host: registry.my-netdata.io
 schemes:
   - http
 basePath: /api/v1
@@ -66,7 +66,7 @@ paths:
           allowEmptyValue: false
         - name: after
           in: query
-          description: 'This parameter can either be an absolute timestamp specifying the starting point of the data to be returned, or a relative number of seconds (relative to parameter: before). Netdata will assume it is a relative number if it is smaller than the duration of the round robin database for this chart. So, if the round robin database is 3600 seconds, any value from -3600 to 3600 will trigger relative arithmetics. Netdata will adapt this parameter to the boundaries of the round robin database.'
+          description: 'This parameter can either be an absolute timestamp specifying the starting point of the data to be returned, or a relative number of seconds (negative, relative to parameter: before). Netdata will assume it is a relative number if it is less that 3 years (in seconds). Netdata will adapt this parameter to the boundaries of the round robin database. The default is the beginning of the round robin database (i.e. by default netdata will attempt to return data for the entire database).'
           required: true
           type: number
           format: integer
@@ -74,14 +74,14 @@ paths:
           default: -600
         - name: before
           in: query
-          description: 'This parameter can either be an absolute timestamp specifying the ending point of the data to be returned, or a relative number of seconds, to the last collected timestamp. Netdata will assume it is a relative number if it is smaller than the duration of the round robin database for this chart. So, if the round robin database is 3600 seconds, any value from -3600 to 3600 will trigger relative arithmetics. Netdata will adapt this parameter to the boundaries of the round robin database.'
+          description: 'This parameter can either be an absolute timestamp specifying the ending point of the data to be returned, or a relative number of seconds (negative), relative to the last collected timestamp. Netdata will assume it is a relative number if it is less than 3 years (in seconds). Netdata will adapt this parameter to the boundaries of the round robin database. The default is zero (i.e. the timestamp of the last value collected).'
           required: false
           type: number
           format: integer
           default: 0
         - name: points
           in: query
-          description: 'The number of points to be returned. If not given, or it is <= 0, or it is bigger than the points stored in the round robin database for this chart for the given duration, all the available collected values for the given duration are returned.'
+          description: 'The number of points to be returned. If not given, or it is <= 0, or it is bigger than the points stored in the round robin database for this chart for the given duration, all the available collected values for the given duration will be returned.'
           required: true
           type: number
           format: integer
@@ -89,10 +89,10 @@ paths:
           default: 20
         - name: group
           in: query
-          description: 'The grouping method. If multiple collected values are to be grouped in order to return fewer points, this parameters defines the method of grouping. 4 methods are supported, "max", "average", "sum", "incremental-sum". "max" is actually calculated on the absolute value collected (so it works for both positive and negative dimesions to return the most extreme value in either direction).'
+          description: 'The grouping method. If multiple collected values are to be grouped in order to return fewer points, this parameters defines the method of grouping. methods supported "min", "max", "average", "sum", "incremental-sum". "max" is actually calculated on the absolute value collected (so it works for both positive and negative dimesions to return the most extreme value in either direction).'
           required: true
           type: string
-          enum: [ 'max', 'average', 'sum', 'incremental-sum' ]
+          enum: [ 'min', 'max', 'average', 'sum', 'incremental-sum' ]
           default: 'average'
           allowEmptyValue: false
         - name: format
@@ -157,6 +157,13 @@ paths:
           format: 'as returned by /charts'
           allowEmptyValue: false
           default: system.cpu
+        - name: alarm
+          in: query
+          description: 'the name of an alarm linked to the chart'
+          required: false
+          type: string
+          format: 'any text'
+          allowEmptyValue: true
         - name: dimension
           in: query
           description: 'zero, one or more dimension ids, as returned by the /chart call.'
@@ -184,10 +191,10 @@ paths:
           default: 0
         - name: group
           in: query
-          description: 'The grouping method. If multiple collected values are to be grouped in order to return fewer points, this parameters defines the method of grouping. 4 methods are supported, "max", "average", "sum", "incremental-sum". "max" is actually calculated on the absolute value collected (so it works for both positive and negative dimesions to return the most extreme value in either direction).'
+          description: 'The grouping method. If multiple collected values are to be grouped in order to return fewer points, this parameters defines the method of grouping. methods are supported "min", "max", "average", "sum", "incremental-sum". "max" is actually calculated on the absolute value collected (so it works for both positive and negative dimesions to return the most extreme value in either direction).'
           required: true
           type: string
-          enum: [ 'max', 'average', 'sum', 'incremental-sum' ]
+          enum: [ 'min', 'max', 'average', 'sum', 'incremental-sum' ]
           default: 'average'
           allowEmptyValue: false
         - name: options
@@ -252,6 +259,23 @@ paths:
           description: 'No chart with the given id is found.'
         '500':
           description: 'Internal server error. This usually means the server is out of memory.'
+  /allmetrics:
+    get:
+      summary: 'Get a value of all the metrics maintained by netdata'
+      description: 'The charts endpoint returns the latest value of all charts and dimensions stored in the netdata server.'
+      parameters:
+        - name: format
+          in: query
+          description: 'The format of the response to be returned'
+          required: true
+          type: string
+          enum: [ 'shell', 'prometheus' ]
+          default: 'shell'
+      responses:
+        '200':
+          description: 'All the metrics returned in the format requested'
+        '400':
+          description: 'The format requested is not supported'
 definitions:
   chart_summary:
     type: object
@@ -259,6 +283,16 @@ definitions:
       hostname:
         type: string
         description: 'The hostname of the netdata server.'
+      version:
+        type: string
+        description: 'netdata version of the server.'
+      os:
+        type: string
+        description: 'The netdata server host operating system.'
+        enum: [ 'macos', 'linux', 'freebsd' ]
+      history:
+        type: number
+        description: 'The duration, in seconds, of the round robin database maintained by netdata.'
       update_every:
         type: number
         description: 'The default update frequency of the netdata server. All charts have an update frequency equal or bigger than this.'
@@ -268,6 +302,18 @@ definitions:
         properties:
           key:
               $ref: '#/definitions/chart'
+      charts_count:
+        type: number
+        description: 'The number of charts.'
+      dimensions_count:
+        type: number
+        description: 'The total number of dimensions.'
+      alarms_count:
+        type: number
+        description: 'The number of alarms.'
+      rrd_memory_bytes:
+        type: number
+        description: 'The size of the round robin database in bytes.'
   chart:
     type: object
     properties:
@@ -320,13 +366,19 @@ definitions:
         properties:
           key:
               $ref: '#/definitions/dimension'
+      green:
+        type: number
+        description: 'Chart health green threshold'
+      red:
+        type: number
+        description: 'Chart health red trheshold'
   dimension:
     type: object
     properties:
       name:
         type: string
         description: 'The name of the dimension'
- 
+        
   json_wrap:
     type: object
     properties:

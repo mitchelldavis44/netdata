@@ -1,4 +1,10 @@
-#!/bin/bash
+# no need for shebang - this file is loaded from charts.d.plugin
+
+# netdata
+# real-time performance and health monitoring, done right!
+# (C) 2016-2017 Costa Tsaousis <costa@tsaousis.gr>
+# GPL v3+
+#
 
 # a space separated list of UPS names
 # if empty, the list returned by 'upsc -l' will be used
@@ -7,7 +13,12 @@ nut_ups=
 # how frequently to collect UPS data
 nut_update_every=2
 
+# how much time in seconds, to wait for nut to respond
 nut_timeout=2
+
+# set this to 1, to enable another chart showing the number
+# of UPS clients connected to upsd
+nut_clients_chart=0
 
 # the priority of nut related to other charts
 nut_priority=90000
@@ -15,11 +26,17 @@ nut_priority=90000
 declare -A nut_ids=()
 
 nut_get_all() {
-	timeout $nut_timeout upsc -l
+	run -t $nut_timeout upsc -l
 }
 
 nut_get() {
-	timeout $nut_timeout upsc "$1"
+	run -t $nut_timeout upsc "$1"
+
+	if [ "${nut_clients_chart}" -eq "1" ]
+		then
+		printf "ups.connected_clients: "
+		run -t $nut_timeout upsc -c "$1" | wc -l
+	fi
 }
 
 nut_check() {
@@ -42,12 +59,12 @@ nut_check() {
 			nut_ids[$x]="$( fixid "$x" )"
 			continue
 		fi
-		echo >&2 "nut: ERROR: Cannot get information for NUT UPS '$x'."
+		error "cannot get information for NUT UPS '$x'."
 	done
 
 	if [ ${#nut_ids[@]} -eq 0 ]
 		then
-		echo >&2 "nut: Please set nut_ups='ups_name' in $confd/nut.conf"
+		error "Cannot find UPSes - please set nut_ups='ups_name' in $confd/nut.conf"
 		return 1
 	fi
 
@@ -91,6 +108,15 @@ DIMENSION load load absolute 1 100
 CHART nut_$x.temp '' "UPS Temperature" "temperature" ups nut.temperature line $((nut_priority + 7)) $nut_update_every
 DIMENSION temp temp absolute 1 100
 EOF
+
+	if [ "${nut_clients_chart}" = "1" ]
+		then
+		cat <<EOF2
+CHART nut_$x.clients '' "UPS Connected Clients" "clients" ups nut.clients area $((nut_priority + 8)) $nut_update_every
+DIMENSION clients '' absolute 1 1
+EOF2
+	fi
+
 	done
 
 	return 0
@@ -125,6 +151,8 @@ BEGIN {
 	output_voltage = 0;
 	load = 0;
 	temp = 0;
+	client = 0;
+	do_clients = ${nut_clients_chart};
 }
 /^battery.charge: .*/			{ battery_charge = \$2 * 100 };
 /^battery.voltage: .*/			{ battery_voltage = \$2 * 100 };
@@ -140,6 +168,7 @@ BEGIN {
 /^output.voltage: .*/			{ output_voltage = \$2 * 100 };
 /^ups.load: .*/					{ load = \$2 * 100 };
 /^ups.temperature: .*/			{ temp = \$2 * 100 };
+/^ups.connected_clients: .*/	{ clients = \$2 };
 END {
 	print \"BEGIN nut_$x.charge $1\";
 	print \"SET battery_charge = \" battery_charge;
@@ -178,10 +207,16 @@ END {
 	print \"BEGIN nut_$x.temp $1\";
 	print \"SET temp = \" temp;
 	print \"END\"
+
+	if(do_clients) {
+		print \"BEGIN nut_$x.clients $1\";
+		print \"SET clients = \" clients;
+		print \"END\"
+	}
 }"
-		[ $? -ne 0 ] && unset nut_ids[$i] && echo >&2 "nut: failed to get values for '$i', disabling it."
+		[ $? -ne 0 ] && unset nut_ids[$i] && error "failed to get values for '$i', disabling it."
 	done
 
-	[ ${#nut_ids[@]} -eq 0 ] && echo >&2 "nut: no UPSes left active." && return 1
+	[ ${#nut_ids[@]} -eq 0 ] && error "no UPSes left active." && return 1
 	return 0
 }

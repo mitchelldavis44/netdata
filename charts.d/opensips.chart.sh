@@ -1,4 +1,10 @@
-#!/bin/sh
+# no need for shebang - this file is loaded from charts.d.plugin
+
+# netdata
+# real-time performance and health monitoring, done right!
+# (C) 2016 Costa Tsaousis <costa@tsaousis.gr>
+# GPL v3+
+#
 
 opensips_opts="fifo get_statistics all"
 opensips_cmd=
@@ -7,15 +13,11 @@ opensips_timeout=2
 opensips_priority=80000
 
 opensips_get_stats() {
-	timeout $opensips_timeout "$opensips_cmd" $opensips_opts |\
-		grep "^\(core\|dialog\|net\|registrar\|shmem\|siptrace\|sl\|tm\|uri\|usrloc\):[a-zA-Z0-9_ -]\+[[:space:]]*=[[:space:]]*[0-9]\+[[:space:]]*$" |\
+	run -t $opensips_timeout "$opensips_cmd" $opensips_opts |\
+		grep "^\(core\|dialog\|net\|registrar\|shmem\|siptrace\|sl\|tm\|uri\|usrloc\):[a-zA-Z0-9_-]\+[[:space:]]*[=:]\+[[:space:]]*[0-9]\+[[:space:]]*$" |\
 		sed \
-			-e "s|-|_|g" \
-			-e "s|:|_|g" \
-			-e "s|[[:space:]]\+=[[:space:]]\+|=|g" \
-			-e "s|[[:space:]]\+$||" \
-			-e "s|^[[:space:]]\+||" \
-			-e "s|[[:space:]]\+|_|" \
+			-e "s|[[:space:]]*[=:]\+[[:space:]]*\([0-9]\+\)[[:space:]]*$|=\1|g" \
+			-e "s|[[:space:]:-]\+|_|g" \
 			-e "s|^|opensips_|g"
 
 	local ret=$?
@@ -35,7 +37,7 @@ opensips_check() {
 	local x="$(opensips_get_stats | grep "^opensips_core_")"
 	if [ ! $? -eq 0 -o -z "$x" ]
 	then
-		echo >&2 "$PROGRAM_NAME: opensips: cannot get global status. Please set opensips_opts='options' whatever needed to get connected to opensips server, in $confd/opensips.conf"
+		error "cannot get global status. Please set opensips_opts='options' whatever needed to get connected to opensips server, in $confd/opensips.conf"
 		return 1
 	fi
 
@@ -218,7 +220,7 @@ opensips_update() {
 	eval "local $(opensips_get_stats)"
 	[ $? -ne 0 ] && return 1
 
-	[ $opensips_command_failed -eq 1 ] && echo >&2 "$PROGRAM_NAME: opensips: failed to get values, disabling." && return 1
+	[ $opensips_command_failed -eq 1 ] && error "failed to get values, disabling." && return 1
 
 	# write the result of the work.
 	cat <<VALUESEOF

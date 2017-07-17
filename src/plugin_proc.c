@@ -1,381 +1,187 @@
-#ifdef HAVE_CONFIG_H
-#include <config.h>
-#endif
-#include <pthread.h>
-#include <sys/time.h>
-#include <sys/resource.h>
-#include <strings.h>
-#include <unistd.h>
-
-#include "global_statistics.h"
 #include "common.h"
-#include "appconfig.h"
-#include "log.h"
-#include "rrd.h"
-#include "plugin_proc.h"
-#include "main.h"
-#include "registry.h"
 
-void *proc_main(void *ptr)
+static struct proc_module {
+    const char *name;
+    const char *dim;
+
+    int enabled;
+
+    int (*func)(int update_every, usec_t dt);
+    usec_t duration;
+
+    RRDDIM *rd;
+
+} proc_modules[] = {
+
+        // system metrics
+        { .name = "/proc/stat", .dim = "stat", .func = do_proc_stat },
+        { .name = "/proc/uptime", .dim = "uptime", .func = do_proc_uptime },
+        { .name = "/proc/loadavg", .dim = "loadavg", .func = do_proc_loadavg },
+        { .name = "/proc/sys/kernel/random/entropy_avail", .dim = "entropy", .func = do_proc_sys_kernel_random_entropy_avail },
+
+        // CPU metrics
+        { .name = "/proc/interrupts", .dim = "interrupts", .func = do_proc_interrupts },
+        { .name = "/proc/softirqs", .dim = "softirqs", .func = do_proc_softirqs },
+
+        // memory metrics
+        { .name = "/proc/vmstat", .dim = "vmstat", .func = do_proc_vmstat },
+        { .name = "/proc/meminfo", .dim = "meminfo", .func = do_proc_meminfo },
+        { .name = "/sys/kernel/mm/ksm", .dim = "ksm", .func = do_sys_kernel_mm_ksm },
+        { .name = "/sys/devices/system/edac/mc", .dim = "ecc", .func = do_proc_sys_devices_system_edac_mc },
+        { .name = "/sys/devices/system/node", .dim = "numa", .func = do_proc_sys_devices_system_node },
+
+        // network metrics
+        { .name = "/proc/net/dev", .dim = "netdev", .func = do_proc_net_dev },
+        { .name = "/proc/net/netstat", .dim = "netstat", .func = do_proc_net_netstat }, // this has to be before /proc/net/snmp, because there is a shared metric
+        { .name = "/proc/net/snmp", .dim = "snmp", .func = do_proc_net_snmp },
+        { .name = "/proc/net/snmp6", .dim = "snmp6", .func = do_proc_net_snmp6 },
+        { .name = "/proc/net/softnet_stat", .dim = "softnet", .func = do_proc_net_softnet_stat },
+        { .name = "/proc/net/ip_vs/stats", .dim = "ipvs", .func = do_proc_net_ip_vs_stats },
+
+        // firewall metrics
+        { .name = "/proc/net/stat/conntrack", .dim = "conntrack", .func = do_proc_net_stat_conntrack },
+        { .name = "/proc/net/stat/synproxy", .dim = "synproxy", .func = do_proc_net_stat_synproxy },
+
+        // disk metrics
+        { .name = "/proc/diskstats", .dim = "diskstats", .func = do_proc_diskstats },
+
+        // NFS metrics
+        { .name = "/proc/net/rpc/nfsd", .dim = "nfsd", .func = do_proc_net_rpc_nfsd },
+        { .name = "/proc/net/rpc/nfs", .dim = "nfs", .func = do_proc_net_rpc_nfs },
+
+        // ZFS metrics
+        { .name = "/proc/spl/kstat/zfs/arcstats", .dim = "zfs_arcstats", .func = do_proc_spl_kstat_zfs_arcstats },
+
+        // IPC metrics
+        { .name = "ipc", .dim = "ipc", .func = do_ipc },
+
+        // the terminator of this array
+        { .name = NULL, .dim = NULL, .func = NULL }
+};
+
+void *proc_main(void *ptr) {
+    struct netdata_static_thread *static_thread = (struct netdata_static_thread *)ptr;
+
+    info("PROC Plugin thread created with task id %d", gettid());
+
+    if(pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL) != 0)
+        error("Cannot set pthread cancel type to DEFERRED.");
+
+    if(pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL) != 0)
+        error("Cannot set pthread cancel state to ENABLE.");
+
+    int vdo_cpu_netdata = config_get_boolean("plugin:proc", "netdata server resources", 1);
+
+    // check the enabled status for each module
+    int i;
+    for(i = 0 ; proc_modules[i].name ;i++) {
+        struct proc_module *pm = &proc_modules[i];
+
+        pm->enabled = config_get_boolean("plugin:proc", pm->name, 1);
+        pm->duration = 0ULL;
+        pm->rd = NULL;
+    }
+
+    usec_t step = localhost->rrd_update_every * USEC_PER_SEC;
+    heartbeat_t hb;
+    heartbeat_init(&hb);
+
+    for(;;) {
+        usec_t hb_dt = heartbeat_next(&hb, step);
+        usec_t duration = 0ULL;
+
+        if(unlikely(netdata_exit)) break;
+
+        // BEGIN -- the job to be done
+
+        for(i = 0 ; proc_modules[i].name ;i++) {
+            struct proc_module *pm = &proc_modules[i];
+            if(unlikely(!pm->enabled)) continue;
+
+            debug(D_PROCNETDEV_LOOP, "PROC calling %s.", pm->name);
+
+            pm->enabled = !pm->func(localhost->rrd_update_every, hb_dt);
+            pm->duration = heartbeat_dt_usec(&hb) - duration;
+            duration += pm->duration;
+
+            if(unlikely(netdata_exit)) break;
+        }
+
+        // END -- the job is done
+
+        // --------------------------------------------------------------------
+
+        if(vdo_cpu_netdata) {
+            static RRDSET *st = NULL;
+
+            if(unlikely(!st)) {
+                st = rrdset_find_bytype_localhost("netdata", "plugin_proc_modules");
+
+                if(!st) {
+                    st = rrdset_create_localhost("netdata", "plugin_proc_modules", NULL, "proc", NULL
+                                                 , "NetData Proc Plugin Modules Durations", "milliseconds/run", 132001
+                                                 , localhost->rrd_update_every, RRDSET_TYPE_STACKED);
+
+                    for(i = 0 ; proc_modules[i].name ;i++) {
+                        struct proc_module *pm = &proc_modules[i];
+                        if(unlikely(!pm->enabled)) continue;
+
+                        pm->rd = rrddim_add(st, pm->dim, NULL, 1, 1000, RRD_ALGORITHM_ABSOLUTE);
+                    }
+                }
+            }
+            else rrdset_next(st);
+
+            for(i = 0 ; proc_modules[i].name ;i++) {
+                struct proc_module *pm = &proc_modules[i];
+                if(unlikely(!pm->enabled)) continue;
+
+                rrddim_set_by_pointer(st, pm->rd, pm->duration);
+            }
+            rrdset_done(st);
+
+            global_statistics_charts();
+            registry_statistics();
+        }
+    }
+
+    info("PROC thread exiting");
+
+    static_thread->enabled = 0;
+    pthread_exit(NULL);
+    return NULL;
+}
+
+int get_numa_node_count(void)
 {
-	(void)ptr;
+    static int numa_node_count = -1;
 
-	unsigned long long old_web_requests = 0, old_web_usec = 0,
-			old_content_size = 0, old_compressed_content_size = 0;
+    if (numa_node_count != -1)
+        return numa_node_count;
 
-	collected_number compression_ratio = -1, average_response_time = -1;
+    numa_node_count = 0;
 
-	info("PROC Plugin thread created with task id %d", gettid());
+    char name[FILENAME_MAX + 1];
+    snprintfz(name, FILENAME_MAX, "%s%s", netdata_configured_host_prefix, "/sys/devices/system/node");
+    char *dirname = config_get("plugin:proc:/sys/devices/system/node", "directory to monitor", name);
 
-	if(pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL) != 0)
-		error("Cannot set pthread cancel type to DEFERRED.");
+    DIR *dir = opendir(dirname);
+    if(dir) {
+        struct dirent *de = NULL;
+        while((de = readdir(dir))) {
+            if(de->d_type != DT_DIR)
+                continue;
 
-	if(pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL) != 0)
-		error("Cannot set pthread cancel state to ENABLE.");
+            if(strncmp(de->d_name, "node", 4) != 0)
+                continue;
 
-	struct rusage me, thread;
+            if(!isdigit(de->d_name[4]))
+                continue;
 
-	// disable (by default) various interface that are not needed
-	config_get_boolean("plugin:proc:/proc/net/dev:lo", "enabled", 0);
-	config_get_boolean("plugin:proc:/proc/net/dev:fireqos_monitor", "enabled", 0);
+            numa_node_count++;
+        }
+        closedir(dir);
+    }
 
-	// when ZERO, attempt to do it
-	int vdo_proc_net_dev 			= !config_get_boolean("plugin:proc", "/proc/net/dev", 1);
-	int vdo_proc_diskstats 			= !config_get_boolean("plugin:proc", "/proc/diskstats", 1);
-	int vdo_proc_net_snmp 			= !config_get_boolean("plugin:proc", "/proc/net/snmp", 1);
-	int vdo_proc_net_snmp6 			= !config_get_boolean("plugin:proc", "/proc/net/snmp6", 1);
-	int vdo_proc_net_netstat 		= !config_get_boolean("plugin:proc", "/proc/net/netstat", 1);
-	int vdo_proc_net_stat_conntrack = !config_get_boolean("plugin:proc", "/proc/net/stat/conntrack", 1);
-	int vdo_proc_net_ip_vs_stats 	= !config_get_boolean("plugin:proc", "/proc/net/ip_vs/stats", 1);
-	int vdo_proc_net_stat_synproxy 	= !config_get_boolean("plugin:proc", "/proc/net/stat/synproxy", 1);
-	int vdo_proc_stat 				= !config_get_boolean("plugin:proc", "/proc/stat", 1);
-	int vdo_proc_meminfo 			= !config_get_boolean("plugin:proc", "/proc/meminfo", 1);
-	int vdo_proc_vmstat 			= !config_get_boolean("plugin:proc", "/proc/vmstat", 1);
-	int vdo_proc_net_rpc_nfsd		= !config_get_boolean("plugin:proc", "/proc/net/rpc/nfsd", 1);
-	int vdo_proc_sys_kernel_random_entropy_avail	= !config_get_boolean("plugin:proc", "/proc/sys/kernel/random/entropy_avail", 1);
-	int vdo_proc_interrupts			= !config_get_boolean("plugin:proc", "/proc/interrupts", 1);
-	int vdo_proc_softirqs			= !config_get_boolean("plugin:proc", "/proc/softirqs", 1);
-	int vdo_proc_loadavg			= !config_get_boolean("plugin:proc", "/proc/loadavg", 1);
-	int vdo_sys_kernel_mm_ksm		= !config_get_boolean("plugin:proc", "/sys/kernel/mm/ksm", 1);
-	int vdo_cpu_netdata 			= !config_get_boolean("plugin:proc", "netdata server resources", 1);
-
-	// keep track of the time each module was called
-	unsigned long long sutime_proc_net_dev = 0ULL;
-	unsigned long long sutime_proc_diskstats = 0ULL;
-	unsigned long long sutime_proc_net_snmp = 0ULL;
-	unsigned long long sutime_proc_net_snmp6 = 0ULL;
-	unsigned long long sutime_proc_net_netstat = 0ULL;
-	unsigned long long sutime_proc_net_stat_conntrack = 0ULL;
-	unsigned long long sutime_proc_net_ip_vs_stats = 0ULL;
-	unsigned long long sutime_proc_net_stat_synproxy = 0ULL;
-	unsigned long long sutime_proc_stat = 0ULL;
-	unsigned long long sutime_proc_meminfo = 0ULL;
-	unsigned long long sutime_proc_vmstat = 0ULL;
-	unsigned long long sutime_proc_net_rpc_nfsd = 0ULL;
-	unsigned long long sutime_proc_sys_kernel_random_entropy_avail = 0ULL;
-	unsigned long long sutime_proc_interrupts = 0ULL;
-	unsigned long long sutime_proc_softirqs = 0ULL;
-	unsigned long long sutime_proc_loadavg = 0ULL;
-	unsigned long long sutime_sys_kernel_mm_ksm = 0ULL;
-
-	// the next time we will run - aligned properly
-	unsigned long long sunext = (time(NULL) - (time(NULL) % rrd_update_every) + rrd_update_every) * 1000000ULL;
-	unsigned long long sunow;
-
-	RRDSET *stcpu = NULL, *stcpu_thread = NULL, *stclients = NULL, *streqs = NULL, *stbytes = NULL, *stduration = NULL,
-			*stcompression = NULL;
-
-	for(;1;) {
-		if(unlikely(netdata_exit)) break;
-
-		// delay until it is our time to run
-		while((sunow = timems()) < sunext)
-			usecsleep(sunext - sunow);
-
-		// find the next time we need to run
-		while(timems() > sunext)
-			sunext += rrd_update_every * 1000000ULL;
-
-		if(unlikely(netdata_exit)) break;
-
-		// BEGIN -- the job to be done
-
-		if(!vdo_sys_kernel_mm_ksm) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_sys_kernel_mm_ksm().");
-
-			sunow = timems();
-			vdo_sys_kernel_mm_ksm = do_sys_kernel_mm_ksm(rrd_update_every, (sutime_sys_kernel_mm_ksm > 0)?sunow - sutime_sys_kernel_mm_ksm:0ULL);
-			sutime_sys_kernel_mm_ksm = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_loadavg) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_loadavg().");
-			sunow = timems();
-			vdo_proc_loadavg = do_proc_loadavg(rrd_update_every, (sutime_proc_loadavg > 0)?sunow - sutime_proc_loadavg:0ULL);
-			sutime_proc_loadavg = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_interrupts) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_interrupts().");
-			sunow = timems();
-			vdo_proc_interrupts = do_proc_interrupts(rrd_update_every, (sutime_proc_interrupts > 0)?sunow - sutime_proc_interrupts:0ULL);
-			sutime_proc_interrupts = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_softirqs) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_softirqs().");
-			sunow = timems();
-			vdo_proc_softirqs = do_proc_softirqs(rrd_update_every, (sutime_proc_softirqs > 0)?sunow - sutime_proc_softirqs:0ULL);
-			sutime_proc_softirqs = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_sys_kernel_random_entropy_avail) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_sys_kernel_random_entropy_avail().");
-			sunow = timems();
-			vdo_proc_sys_kernel_random_entropy_avail = do_proc_sys_kernel_random_entropy_avail(rrd_update_every, (sutime_proc_sys_kernel_random_entropy_avail > 0)?sunow - sutime_proc_sys_kernel_random_entropy_avail:0ULL);
-			sutime_proc_sys_kernel_random_entropy_avail = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_net_dev) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_net_dev().");
-			sunow = timems();
-			vdo_proc_net_dev = do_proc_net_dev(rrd_update_every, (sutime_proc_net_dev > 0)?sunow - sutime_proc_net_dev:0ULL);
-			sutime_proc_net_dev = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_diskstats) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_diskstats().");
-			sunow = timems();
-			vdo_proc_diskstats = do_proc_diskstats(rrd_update_every, (sutime_proc_diskstats > 0)?sunow - sutime_proc_diskstats:0ULL);
-			sutime_proc_diskstats = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_net_snmp) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_net_snmp().");
-			sunow = timems();
-			vdo_proc_net_snmp = do_proc_net_snmp(rrd_update_every, (sutime_proc_net_snmp > 0)?sunow - sutime_proc_net_snmp:0ULL);
-			sutime_proc_net_snmp = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_net_snmp6) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_net_snmp6().");
-			sunow = timems();
-			vdo_proc_net_snmp6 = do_proc_net_snmp6(rrd_update_every, (sutime_proc_net_snmp6 > 0)?sunow - sutime_proc_net_snmp6:0ULL);
-			sutime_proc_net_snmp6 = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_net_netstat) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_net_netstat().");
-			sunow = timems();
-			vdo_proc_net_netstat = do_proc_net_netstat(rrd_update_every, (sutime_proc_net_netstat > 0)?sunow - sutime_proc_net_netstat:0ULL);
-			sutime_proc_net_netstat = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_net_stat_conntrack) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_net_stat_conntrack().");
-			sunow = timems();
-			vdo_proc_net_stat_conntrack	= do_proc_net_stat_conntrack(rrd_update_every, (sutime_proc_net_stat_conntrack > 0)?sunow - sutime_proc_net_stat_conntrack:0ULL);
-			sutime_proc_net_stat_conntrack = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_net_ip_vs_stats) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling vdo_proc_net_ip_vs_stats().");
-			sunow = timems();
-			vdo_proc_net_ip_vs_stats = do_proc_net_ip_vs_stats(rrd_update_every, (sutime_proc_net_ip_vs_stats > 0)?sunow - sutime_proc_net_ip_vs_stats:0ULL);
-			sutime_proc_net_ip_vs_stats = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_net_stat_synproxy) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling vdo_proc_net_stat_synproxy().");
-			sunow = timems();
-			vdo_proc_net_stat_synproxy = do_proc_net_stat_synproxy(rrd_update_every, (sutime_proc_net_stat_synproxy > 0)?sunow - sutime_proc_net_stat_synproxy:0ULL);
-			sutime_proc_net_stat_synproxy = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_stat) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_stat().");
-			sunow = timems();
-			vdo_proc_stat = do_proc_stat(rrd_update_every, (sutime_proc_stat > 0)?sunow - sutime_proc_stat:0ULL);
-			sutime_proc_stat = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_meminfo) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling vdo_proc_meminfo().");
-			sunow = timems();
-			vdo_proc_meminfo = do_proc_meminfo(rrd_update_every, (sutime_proc_meminfo > 0)?sunow - sutime_proc_meminfo:0ULL);
-			sutime_proc_meminfo = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_vmstat) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling vdo_proc_vmstat().");
-			sunow = timems();
-			vdo_proc_vmstat = do_proc_vmstat(rrd_update_every, (sutime_proc_vmstat > 0)?sunow - sutime_proc_vmstat:0ULL);
-			sutime_proc_vmstat = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		if(!vdo_proc_net_rpc_nfsd) {
-			debug(D_PROCNETDEV_LOOP, "PROCNETDEV: calling do_proc_net_rpc_nfsd().");
-			sunow = timems();
-			vdo_proc_net_rpc_nfsd = do_proc_net_rpc_nfsd(rrd_update_every, (sutime_proc_net_rpc_nfsd > 0)?sunow - sutime_proc_net_rpc_nfsd:0ULL);
-			sutime_proc_net_rpc_nfsd = sunow;
-		}
-		if(unlikely(netdata_exit)) break;
-
-		// END -- the job is done
-
-		// --------------------------------------------------------------------
-
-		if(!vdo_cpu_netdata) {
-			getrusage(RUSAGE_THREAD, &thread);
-			getrusage(RUSAGE_SELF, &me);
-
-			if(!stcpu_thread) stcpu_thread = rrdset_find("netdata.plugin_proc_cpu");
-			if(!stcpu_thread) {
-				stcpu_thread = rrdset_create("netdata", "plugin_proc_cpu", NULL, "proc.internal", NULL, "NetData Proc Plugin CPU usage", "milliseconds/s", 132000, rrd_update_every, RRDSET_TYPE_STACKED);
-
-				rrddim_add(stcpu_thread, "user",  NULL,  1, 1000, RRDDIM_INCREMENTAL);
-				rrddim_add(stcpu_thread, "system", NULL, 1, 1000, RRDDIM_INCREMENTAL);
-			}
-			else rrdset_next(stcpu_thread);
-
-			rrddim_set(stcpu_thread, "user"  , thread.ru_utime.tv_sec * 1000000ULL + thread.ru_utime.tv_usec);
-			rrddim_set(stcpu_thread, "system", thread.ru_stime.tv_sec * 1000000ULL + thread.ru_stime.tv_usec);
-			rrdset_done(stcpu_thread);
-
-			// ----------------------------------------------------------------
-
-			if(!stcpu) stcpu = rrdset_find("netdata.server_cpu");
-			if(!stcpu) {
-				stcpu = rrdset_create("netdata", "server_cpu", NULL, "netdata", NULL, "NetData CPU usage", "milliseconds/s", 130000, rrd_update_every, RRDSET_TYPE_STACKED);
-
-				rrddim_add(stcpu, "user",  NULL,  1, 1000, RRDDIM_INCREMENTAL);
-				rrddim_add(stcpu, "system", NULL, 1, 1000, RRDDIM_INCREMENTAL);
-			}
-			else rrdset_next(stcpu);
-
-			rrddim_set(stcpu, "user"  , me.ru_utime.tv_sec * 1000000ULL + me.ru_utime.tv_usec);
-			rrddim_set(stcpu, "system", me.ru_stime.tv_sec * 1000000ULL + me.ru_stime.tv_usec);
-			rrdset_done(stcpu);
-
-			// ----------------------------------------------------------------
-
-			if(!stclients) stclients = rrdset_find("netdata.clients");
-			if(!stclients) {
-				stclients = rrdset_create("netdata", "clients", NULL, "netdata", NULL, "NetData Web Clients", "connected clients", 130100, rrd_update_every, RRDSET_TYPE_LINE);
-
-				rrddim_add(stclients, "clients",  NULL,  1, 1, RRDDIM_ABSOLUTE);
-			}
-			else rrdset_next(stclients);
-
-			rrddim_set(stclients, "clients", global_statistics.connected_clients);
-			rrdset_done(stclients);
-
-			// ----------------------------------------------------------------
-
-			if(!streqs) streqs = rrdset_find("netdata.requests");
-			if(!streqs) {
-				streqs = rrdset_create("netdata", "requests", NULL, "netdata", NULL, "NetData Web Requests", "requests/s", 130200, rrd_update_every, RRDSET_TYPE_LINE);
-
-				rrddim_add(streqs, "requests",  NULL,  1, 1, RRDDIM_INCREMENTAL);
-			}
-			else rrdset_next(streqs);
-
-			rrddim_set(streqs, "requests", global_statistics.web_requests);
-			rrdset_done(streqs);
-
-			// ----------------------------------------------------------------
-
-			if(!stbytes) stbytes = rrdset_find("netdata.net");
-			if(!stbytes) {
-				stbytes = rrdset_create("netdata", "net", NULL, "netdata", NULL, "NetData Network Traffic", "kilobits/s", 130300, rrd_update_every, RRDSET_TYPE_AREA);
-
-				rrddim_add(stbytes, "in",  NULL,  8, 1024, RRDDIM_INCREMENTAL);
-				rrddim_add(stbytes, "out",  NULL,  -8, 1024, RRDDIM_INCREMENTAL);
-			}
-			else rrdset_next(stbytes);
-
-			rrddim_set(stbytes, "in", global_statistics.bytes_received);
-			rrddim_set(stbytes, "out", global_statistics.bytes_sent);
-			rrdset_done(stbytes);
-
-			// ----------------------------------------------------------------
-
-			if(!stduration) stduration = rrdset_find("netdata.response_time");
-			if(!stduration) {
-				stduration = rrdset_create("netdata", "response_time", NULL, "netdata", NULL, "NetData Average API Response Time", "ms/request", 130400, rrd_update_every, RRDSET_TYPE_LINE);
-
-				rrddim_add(stduration, "response_time", "response time",  1, 1000, RRDDIM_ABSOLUTE);
-			}
-			else rrdset_next(stduration);
-
-			unsigned long long gweb_usec     = global_statistics.web_usec;
-			unsigned long long gweb_requests = global_statistics.web_requests;
-
-			unsigned long long web_usec     = gweb_usec     - old_web_usec;
-			unsigned long long web_requests = gweb_requests - old_web_requests;
-
-			old_web_usec     = gweb_usec;
-			old_web_requests = gweb_requests;
-
-			if(web_requests)
-				average_response_time =  web_usec / web_requests;
-
-			if(average_response_time != -1)
-				rrddim_set(stduration, "response_time", average_response_time);
-
-			rrdset_done(stduration);
-
-			// ----------------------------------------------------------------
-
-			if(!stcompression) stcompression = rrdset_find("netdata.compression_ratio");
-			if(!stcompression) {
-				stcompression = rrdset_create("netdata", "compression_ratio", NULL, "netdata", NULL, "NetData API Responses Compression Savings Ratio", "percentage", 130500, rrd_update_every, RRDSET_TYPE_LINE);
-
-				rrddim_add(stcompression, "savings", NULL,  1, 1000, RRDDIM_ABSOLUTE);
-			}
-			else rrdset_next(stcompression);
-
-			// since we don't lock here to read the global statistics
-			// read the smaller value first
-			unsigned long long gcompressed_content_size = global_statistics.compressed_content_size;
-			unsigned long long gcontent_size            = global_statistics.content_size;
-
-			unsigned long long compressed_content_size  = gcompressed_content_size - old_compressed_content_size;
-			unsigned long long content_size             = gcontent_size            - old_content_size;
-
-			old_compressed_content_size = gcompressed_content_size;
-			old_content_size            = gcontent_size;
-
-			if(content_size && content_size >= compressed_content_size)
-				compression_ratio = ((content_size - compressed_content_size) * 100 * 1000) / content_size;
-
-			if(compression_ratio != -1)
-				rrddim_set(stcompression, "savings", compression_ratio);
-
-			rrdset_done(stcompression);
-
-			// ----------------------------------------------------------------
-
-			registry_statistics();
-		}
-	}
-
-	pthread_exit(NULL);
-	return NULL;
+    return numa_node_count;
 }

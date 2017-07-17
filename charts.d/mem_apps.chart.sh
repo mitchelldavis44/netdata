@@ -1,4 +1,10 @@
-#!/bin/sh
+# no need for shebang - this file is loaded from charts.d.plugin
+
+# netdata
+# real-time performance and health monitoring, done right!
+# (C) 2016 Costa Tsaousis <costa@tsaousis.gr>
+# GPL v3+
+#
 
 mem_apps_apps=
 
@@ -15,7 +21,7 @@ mem_apps_check() {
 
 	if [ -z "$mem_apps_apps" ]
 	then
-		echo >&2 "$PROGRAM_NAME: mem_apps: not configured. Please set mem_apps_apps='command1 command2 ...' in $confd/mem_apps_apps.conf"
+		error "manual configuration required: please set mem_apps_apps='command1 command2 ...' in $confd/mem_apps_apps.conf"
 		return 1
 	fi
 	return 0

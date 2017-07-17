@@ -1,5 +1,3 @@
-#include <stdint.h>
-
 #ifndef NETDATA_STORAGE_NUMBER_H
 #define NETDATA_STORAGE_NUMBER_H
 
@@ -19,18 +17,19 @@ typedef long double collected_number;
 typedef uint32_t storage_number;
 #define STORAGE_NUMBER_FORMAT "%u"
 
-#define SN_NOT_EXISTS		(0x0 << 24)
-#define SN_EXISTS			(0x1 << 24)
-#define SN_EXISTS_RESET		(0x2 << 24)
-#define SN_EXISTS_UNDEF1	(0x3 << 24)
-#define SN_EXISTS_UNDEF2	(0x4 << 24)
-#define SN_EXISTS_UNDEF3	(0x5 << 24)
-#define SN_EXISTS_UNDEF4	(0x6 << 24)
+#define SN_NOT_EXISTS       (0x0 << 24)
+#define SN_EXISTS           (0x1 << 24)
+#define SN_EXISTS_RESET     (0x2 << 24)
+#define SN_EXISTS_UNDEF1    (0x3 << 24)
+#define SN_EXISTS_UNDEF2    (0x4 << 24)
+#define SN_EXISTS_UNDEF3    (0x5 << 24)
+#define SN_EXISTS_UNDEF4    (0x6 << 24)
 
-#define SN_FLAGS_MASK		(~(0x6 << 24))
+#define SN_FLAGS_MASK       (~(0x6 << 24))
 
 // extract the flags
 #define get_storage_number_flags(value) ((((storage_number)value) & (1 << 24)) | (((storage_number)value) & (2 << 24)) | (((storage_number)value) & (4 << 24)))
+#define SN_EMPTY_SLOT 0x00000000
 
 // checks
 #define does_storage_number_exist(value) ((get_storage_number_flags(value) != 0)?1:0)

@@ -7,17 +7,13 @@
  *
  */
 
-#include <stdio.h>
-#include <inttypes.h>
-
-#include "dictionary.h"
-#include "main.h"
-#include "log.h"
 #include "common.h"
 
 struct myvalue {
 	int i;
 };
+
+void netdata_cleanup_and_exit(int ret) { exit(ret); }
 
 int main(int argc, char **argv) {
 	if(argc || argv) {;}
@@ -30,7 +26,7 @@ int main(int argc, char **argv) {
 	unsigned long long dt;
 	char buf[100 + 1];
 	struct myvalue value, *v;
-	int i, max = 100000, max2;
+	int i, max = 30000000, max2;
 
 	// ------------------------------------------------------------------------
 

@@ -7,7 +7,7 @@ from base import UrlService
 # default module values (can be overridden per job in `config`)
 # update_every = 2
 priority = 60000
-retries = 5
+retries = 60
 
 # default job configuration (overridden by python.d.plugin)
 # config = {'local': {
@@ -22,24 +22,24 @@ ORDER = ['connections', 'requests', 'connection_status', 'connect_rate']
 
 CHARTS = {
     'connections': {
-        'options': [None, 'nginx Active Connections', 'connections', 'nginx', 'nginx.connections', 'line'],
+        'options': [None, 'nginx Active Connections', 'connections', 'active connections', 'nginx.connections', 'line'],
         'lines': [
             ["active"]
         ]},
     'requests': {
-        'options': [None, 'nginx Requests', 'requests/s', 'nginx', 'nginx.requests', 'line'],
+        'options': [None, 'nginx Requests', 'requests/s', 'requests', 'nginx.requests', 'line'],
         'lines': [
             ["requests", None, 'incremental']
         ]},
     'connection_status': {
-        'options': [None, 'nginx Active Connections by Status', 'connections', 'nginx', 'nginx.connection.status', 'line'],
+        'options': [None, 'nginx Active Connections by Status', 'connections', 'status', 'nginx.connection_status', 'line'],
         'lines': [
             ["reading"],
             ["writing"],
             ["waiting", "idle"]
         ]},
     'connect_rate': {
-        'options': [None, 'nginx Connections Rate', 'connections/s', 'nginx', 'nginx.performance', 'line'],
+        'options': [None, 'nginx Connections Rate', 'connections/s', 'connections rate', 'nginx.connect_rate', 'line'],
         'lines': [
             ["accepts", "accepted", "incremental"],
             ["handled", None, "incremental"]
@@ -63,11 +63,11 @@ class Service(UrlService):
         try:
             raw = self._get_raw_data().split(" ")
             return {'active': int(raw[2]),
-                    'requests': int(raw[7]),
+                    'requests': int(raw[9]),
                     'reading': int(raw[11]),
                     'writing': int(raw[13]),
                     'waiting': int(raw[15]),
-                    'accepts': int(raw[8]),
-                    'handled': int(raw[9])}
+                    'accepts': int(raw[7]),
+                    'handled': int(raw[8])}
         except (ValueError, AttributeError):
             return None

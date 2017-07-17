@@ -1,4 +1,10 @@
-#!/bin/sh
+# no need for shebang - this file is loaded from charts.d.plugin
+
+# netdata
+# real-time performance and health monitoring, done right!
+# (C) 2016 Costa Tsaousis <costa@tsaousis.gr>
+# GPL v3+
+#
 
 squid_host=
 squid_port=
@@ -9,7 +15,7 @@ squid_priority=60000
 
 squid_get_stats_internal() {
 	local host="$1" port="$2" url="$3"
-	squidclient -h $host -p $port $url
+	run squidclient -h $host -p $port $url
 }
 
 squid_get_stats() {
@@ -29,13 +35,13 @@ squid_autodetect() {
 				squid_host="$host"
 				squid_port="$port"
 				squid_url="$url"
-				echo >&2 "squid: found squid at '$host:$port' with url '$url'"
+				debug "found squid at '$host:$port' with url '$url'"
 				return 0
 			fi
 		done
 	done
 
-	echo >&2 "squid: cannot find squid running in localhost. Please set squid_url='url' and squid_host='IP' and squid_port='PORT' in $confd/squid.conf"
+	error "cannot find squid running in localhost. Please set squid_url='url' and squid_host='IP' and squid_port='PORT' in $confd/squid.conf"
 	return 1
 }
 
@@ -53,7 +59,7 @@ squid_check() {
 	local x="$(squid_get_stats | grep client_http.requests)"
 	if [ ! $? -eq 0 -o -z "$x" ]
 	then
-		echo >&2 "squid: cannot fetch URL '$squid_url' by connecting to $squid_host:$squid_port. Please set squid_url='url' and squid_host='host' and squid_port='port' in $confd/squid.conf"
+		error "cannot fetch URL '$squid_url' by connecting to $squid_host:$squid_port. Please set squid_url='url' and squid_host='host' and squid_port='port' in $confd/squid.conf"
 		return 1
 	fi
 
@@ -63,21 +69,21 @@ squid_check() {
 squid_create() {
 	# create the charts
 	cat <<EOF
-CHART squid.clients_net '' "Squid Client Bandwidth" "kilobits / sec" clients squid.clients.net area $((squid_priority + 1)) $squid_update_every
+CHART squid_local.clients_net '' "Squid Client Bandwidth" "kilobits / sec" clients squid.clients.net area $((squid_priority + 1)) $squid_update_every
 DIMENSION client_http_kbytes_in in incremental 8 1
 DIMENSION client_http_kbytes_out out incremental -8 1
 DIMENSION client_http_hit_kbytes_out hits incremental -8 1
 
-CHART squid.clients_requests '' "Squid Client Requests" "requests / sec" clients squid.clients.requests line $((squid_priority + 3)) $squid_update_every
+CHART squid_local.clients_requests '' "Squid Client Requests" "requests / sec" clients squid.clients.requests line $((squid_priority + 3)) $squid_update_every
 DIMENSION client_http_requests requests incremental 1 1
 DIMENSION client_http_hits hits incremental 1 1
 DIMENSION client_http_errors errors incremental -1 1
 
-CHART squid.servers_net '' "Squid Server Bandwidth" "kilobits / sec" servers squid.servers.net area $((squid_priority + 2)) $squid_update_every
+CHART squid_local.servers_net '' "Squid Server Bandwidth" "kilobits / sec" servers squid.servers.net area $((squid_priority + 2)) $squid_update_every
 DIMENSION server_all_kbytes_in in incremental 8 1
 DIMENSION server_all_kbytes_out out incremental -8 1
 
-CHART squid.servers_requests '' "Squid Server Requests" "requests / sec" servers squid.servers.requests line $((squid_priority + 4)) $squid_update_every
+CHART squid_local.servers_requests '' "Squid Server Requests" "requests / sec" servers squid.servers.requests line $((squid_priority + 4)) $squid_update_every
 DIMENSION server_all_requests requests incremental 1 1
 DIMENSION server_all_errors errors incremental -1 1
 EOF
@@ -111,24 +117,24 @@ squid_update() {
 
 	# write the result of the work.
 	cat <<VALUESEOF
-BEGIN squid.clients_net $1
+BEGIN squid_local.clients_net $1
 SET client_http_kbytes_in = $squid_client_http_kbytes_in
 SET client_http_kbytes_out = $squid_client_http_kbytes_out
 SET client_http_hit_kbytes_out = $squid_client_http_hit_kbytes_out
 END
 
-BEGIN squid.clients_requests $1
+BEGIN squid_local.clients_requests $1
 SET client_http_requests = $squid_client_http_requests
 SET client_http_hits = $squid_client_http_hits
 SET client_http_errors = $squid_client_http_errors
 END
 
-BEGIN squid.servers_net $1
+BEGIN squid_local.servers_net $1
 SET server_all_kbytes_in = $squid_server_all_kbytes_in
 SET server_all_kbytes_out = $squid_server_all_kbytes_out
 END
 
-BEGIN squid.servers_requests $1
+BEGIN squid_local.servers_requests $1
 SET server_all_requests = $squid_server_all_requests
 SET server_all_errors = $squid_server_all_errors
 END

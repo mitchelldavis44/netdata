@@ -1,24 +1,58 @@
 # -*- coding: utf-8 -*-
-# Description: prototypes for netdata python.d modules
+# Description: netdata python modules framework
 # Author: Pawel Krupa (paulfantom)
 
+# Remember:
+# ALL CODE NEEDS TO BE COMPATIBLE WITH Python > 2.7 and Python > 3.1
+# Follow PEP8 as much as it is possible
+# "check" and "create" CANNOT be blocking.
+# "update" CAN be blocking
+# "update" function needs to be fast, so follow:
+#   https://wiki.python.org/moin/PythonSpeed/PerformanceTips
+# basically:
+#  - use local variables wherever it is possible
+#  - avoid dots in expressions that are executed many times
+#  - use "join()" instead of "+"
+#  - use "import" only at the beginning
+#
+# using ".encode()" in one thread can block other threads as well (only in python2)
+
 import time
-import sys
 import os
 import socket
-import resource
+import threading
+import ssl
+from subprocess import Popen, PIPE
+from sys import exc_info
+from glob import glob
+import re
+try:
+    from urlparse import urlparse
+except ImportError:
+    from urllib.parse import urlparse
 try:
     import urllib.request as urllib2
 except ImportError:
     import urllib2
-
-from subprocess import Popen, PIPE
-
-import threading
+try:
+    import MySQLdb
+    PYMYSQL = True
+except ImportError:
+    try:
+        import pymysql as MySQLdb
+        PYMYSQL = True
+    except ImportError:
+        PYMYSQL = False
 import msg
 
+try:
+    PATH = os.getenv('PATH').split(':')
+except AttributeError:
+    PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'.split(':')
 
-class BaseService(threading.Thread):
+
+# class BaseService(threading.Thread):
+class SimpleService(threading.Thread):
     """
     Prototype of Service class.
     Implemented basic functionality to run jobs by `python.d.plugin`
@@ -41,6 +75,11 @@ class BaseService(threading.Thread):
         self.chart_name = ""
         self._dimensions = []
         self._charts = []
+        self.__chart_set = False
+        self.__first_run = True
+        self.order = []
+        self.definitions = {}
+        self._data_from_check = dict()
         if configuration is None:
             self.error("BaseService: no configuration parameters supplied. Cannot create Service.")
             raise RuntimeError
@@ -48,6 +87,8 @@ class BaseService(threading.Thread):
             self._extract_base_config(configuration)
             self.timetable = {}
             self.create_timetable()
+
+    # --- BASIC SERVICE CONFIGURATION ---
 
     def _extract_base_config(self, config):
         """
@@ -58,13 +99,14 @@ class BaseService(threading.Thread):
                       'retries':0}
         :param config: dict
         """
+        pop = config.pop
         try:
-            self.override_name = config.pop('name')
+            self.override_name = pop('name')
         except KeyError:
             pass
-        self.update_every = int(config.pop('update_every'))
-        self.priority = int(config.pop('priority'))
-        self.retries = int(config.pop('retries'))
+        self.update_every = int(pop('update_every'))
+        self.priority = int(pop('priority'))
+        self.retries = int(pop('retries'))
         self.retries_left = self.retries
         self.configuration = config
 
@@ -85,45 +127,33 @@ class BaseService(threading.Thread):
                           'next': now - (now % freq) + freq,
                           'freq': freq}
 
+    # --- THREAD CONFIGURATION ---
+
     def _run_once(self):
         """
         Executes self.update(interval) and draws run time chart.
         Return value presents exit status of update()
         :return: boolean
         """
-        t_start = time.time()
-        # check if it is time to execute job update() function
-        if self.timetable['next'] > t_start:
-            #msg.debug(self.chart_name + " will be run in " +
-            #          str(int((self.timetable['next'] - t_start) * 1000)) + " ms")
-            msg.debug(self.chart_name,"will be run in", str(int((self.timetable['next'] - t_start) * 1000)), "ms")
-            return True
+        t_start = float(time.time())
+        chart_name = self.chart_name
 
         since_last = int((t_start - self.timetable['last']) * 1000000)
-        #msg.debug(self.chart_name +
-        #          " ready to run, after " + str(int((t_start - self.timetable['last']) * 1000)) +
-        #          " ms (update_every: " + str(self.timetable['freq'] * 1000) +
-        #          " ms, latency: " + str(int((t_start - self.timetable['next']) * 1000)) + " ms)")
-        msg.debug(self.chart_name,
-                  "ready to run, after", str(int((t_start - self.timetable['last']) * 1000)),
-                  "ms (update_every:", str(self.timetable['freq'] * 1000),
-                  "ms, latency:", str(int((t_start - self.timetable['next']) * 1000)), "ms")
-        if not self.update(since_last):
-            return False
-        t_end = time.time()
-        self.timetable['next'] = t_end - (t_end % self.timetable['freq']) + self.timetable['freq']
-        # draw performance graph
-        run_time = str(int((t_end - t_start) * 1000))
-        #run_time_chart = "BEGIN netdata.plugin_pythond_" + self.chart_name + " " + str(since_last) + '\n'
-        #run_time_chart += "SET run_time = " + run_time + '\n'
-        #run_time_chart += "END\n"
-        #sys.stdout.write(run_time_chart)
-        sys.stdout.write("BEGIN netdata.plugin_pythond_%s %s\nSET run_time = %s\nEND\n" % \
-                         (self.chart_name, str(since_last), run_time))
+        if self.__first_run:
+            since_last = 0
 
-        #msg.debug(self.chart_name + " updated in " + str(run_time) + " ms")
-        msg.debug(self.chart_name, "updated in", str(run_time), "ms")
+        if not self.update(since_last):
+            self.error("update function failed.")
+            return False
+
+        # draw performance graph
+        run_time = int((time.time() - t_start) * 1000)
+        print("BEGIN netdata.plugin_pythond_%s %s\nSET run_time = %s\nEND\n" %
+              (self.chart_name, str(since_last), str(run_time)))
+
+        self.debug(chart_name, "updated in", str(run_time), "ms")
         self.timetable['last'] = t_start
+        self.__first_run = False
         return True
 
     def run(self):
@@ -132,25 +162,61 @@ class BaseService(threading.Thread):
         Exits when job failed or timed out.
         :return: None
         """
-        self.timetable['last'] = time.time()
-        while True:
+        step = float(self.timetable['freq'])
+        penalty = 0
+        self.timetable['last'] = float(time.time() - step)
+        self.debug("starting data collection - update frequency:", str(step), " retries allowed:", str(self.retries))
+        while True:  # run forever, unless something is wrong
+            now = float(time.time())
+            next = self.timetable['next'] = now - (now % step) + step + penalty
+
+            # it is important to do this in a loop
+            # sleep() is interruptable
+            while now < next:
+                self.debug("sleeping for", str(next - now), "secs to reach frequency of",
+                           str(step), "secs, now:", str(now), " next:", str(next), " penalty:", str(penalty))
+                time.sleep(next - now)
+                now = float(time.time())
+
+            # do the job
             try:
                 status = self._run_once()
-            except Exception as e:
-                msg.error("Something wrong: " + str(e))
-                return
+            except Exception:
+                status = False
+
             if status:
-                time.sleep(self.timetable['next'] - time.time())
+                # it is good
                 self.retries_left = self.retries
+                penalty = 0
             else:
+                # it failed
                 self.retries_left -= 1
                 if self.retries_left <= 0:
-                    msg.error("no more retries. Exiting")
-                    return
-                else:
-                    time.sleep(self.timetable['freq'])
+                    if penalty == 0:
+                        penalty = float(self.retries * step) / 2
+                    else:
+                        penalty *= 1.5
 
-    def _format(self, *args):
+                    if penalty > 600:
+                        penalty = 600
+
+                    self.retries_left = self.retries
+                    self.alert("failed to collect data for " + str(self.retries) +
+                               " times - increasing penalty to " + str(penalty) + " sec and trying again")
+
+                else:
+                    self.error("failed to collect data - " + str(self.retries_left)
+                               + " retries left - penalty: " + str(penalty) + " sec")
+
+    # --- CHART ---
+
+    @staticmethod
+    def _format(*args):
+        """
+        Escape and convert passed arguments.
+        :param args: anything
+        :return: list
+        """
         params = []
         append = params.append
         for p in args:
@@ -167,28 +233,14 @@ class BaseService(threading.Thread):
     def _line(self, instruction, *params):
         """
         Converts *params to string and joins them with one space between every one.
+        Result is appended to self._data_stream
         :param params: str/int/float
         """
-        #self._data_stream += instruction
         tmp = list(map((lambda x: "''" if x is None or len(x) == 0 else x), params))
-
         self._data_stream += "%s %s\n" % (instruction, str(" ".join(tmp)))
 
-        # self.error(str(" ".join(tmp)))
-        # for p in params:
-        #     if p is None:
-        #         p = ""
-        #     else:
-        #         p = str(p)
-        #     if len(p) == 0:
-        #         p = "''"
-        #     if ' ' in p:
-        #         p = "'" + p + "'"
-        #     self._data_stream += " " + p
-        #self._data_stream += "\n"
-
     def chart(self, type_id, name="", title="", units="", family="",
-              category="", charttype="line", priority="", update_every=""):
+              category="", chart_type="line", priority="", update_every=""):
         """
         Defines a new chart.
         :param type_id: str
@@ -197,17 +249,14 @@ class BaseService(threading.Thread):
         :param units: str
         :param family: str
         :param category: str
-        :param charttype: str
+        :param chart_type: str
         :param priority: int/str
         :param update_every: int/str
         """
         self._charts.append(type_id)
-        #self._line("CHART", type_id, name, title, units, family, category, charttype, priority, update_every)
 
-        p = self._format(type_id, name, title, units, family, category, charttype, priority, update_every)
+        p = self._format(type_id, name, title, units, family, category, chart_type, priority, update_every)
         self._line("CHART", *p)
-
-
 
     def dimension(self, id, name=None, algorithm="absolute", multiplier=1, divisor=1, hidden=False):
         """
@@ -235,13 +284,11 @@ class BaseService(threading.Thread):
         if algorithm not in ("absolute", "incremental", "percentage-of-absolute-row", "percentage-of-incremental-row"):
             algorithm = "absolute"
 
-        self._dimensions.append(id)
+        self._dimensions.append(str(id))
         if hidden:
             p = self._format(id, name, algorithm, multiplier, divisor, "hidden")
-            #self._line("DIMENSION", id, name, algorithm, str(multiplier), str(divisor), "hidden")
         else:
             p = self._format(id, name, algorithm, multiplier, divisor)
-            #self._line("DIMENSION", id, name, algorithm, str(multiplier), str(divisor))
 
         self._line("DIMENSION", *p)
 
@@ -272,31 +319,48 @@ class BaseService(threading.Thread):
         :return: boolean
         """
         if id not in self._dimensions:
-            self.error("wrong dimension id:", id)
+            self.error("wrong dimension id:", id, "Available dimensions are:", *self._dimensions)
             return False
         try:
             value = str(int(value))
         except TypeError:
-            self.error("cannot set non-numeric value:", value)
+            self.error("cannot set non-numeric value:", str(value))
             return False
         self._line("SET", id, "=", str(value))
+        self.__chart_set = True
         return True
 
     def end(self):
-        self._line("END")
+        if self.__chart_set:
+            self._line("END")
+            self.__chart_set = False
+        else:
+            pos = self._data_stream.rfind("BEGIN")
+            self._data_stream = self._data_stream[:pos]
 
     def commit(self):
         """
-        Upload new data to netdata
+        Upload new data to netdata.
         """
-        print(self._data_stream)
+        try:
+            print(self._data_stream)
+        except Exception as e:
+            msg.fatal('cannot send data to netdata:', str(e))
         self._data_stream = ""
+
+    # --- ERROR HANDLING ---
 
     def error(self, *params):
         """
         Show error message on stderr
         """
         msg.error(self.chart_name, *params)
+
+    def alert(self, *params):
+        """
+        Show error message on stderr
+        """
+        msg.alert(self.chart_name, *params)
 
     def debug(self, *params):
         """
@@ -310,37 +374,7 @@ class BaseService(threading.Thread):
         """
         msg.info(self.chart_name, *params)
 
-    def check(self):
-        """
-        check() prototype
-        :return: boolean
-        """
-        msg.error("Service " + str(self.__module__) + "doesn't implement check() function")
-        return False
-
-    def create(self):
-        """
-        create() prototype
-        :return: boolean
-        """
-        msg.error("Service " + str(self.__module__) + "doesn't implement create() function?")
-        return False
-
-    def update(self, interval):
-        """
-        update() prototype
-        :param interval: int
-        :return: boolean
-        """
-        msg.error("Service " + str(self.__module__) + "doesn't implement update() function")
-        return False
-
-
-class SimpleService(BaseService):
-    def __init__(self, configuration=None, name=None):
-        self.order = []
-        self.definitions = {}
-        BaseService.__init__(self, configuration=configuration, name=name)
+    # --- MAIN METHODS ---
 
     def _get_data(self):
         """
@@ -351,8 +385,21 @@ class SimpleService(BaseService):
 
     def check(self):
         """
-        :return:
+        check() prototype
+        :return: boolean
         """
+        self.debug("Module", str(self.__module__), "doesn't implement check() function. Using default.")
+        data = self._get_data()
+
+        if data is None:
+            self.debug("failed to receive data during check().")
+            return False
+
+        if len(data) == 0:
+            self.debug("empty data during check().")
+            return False
+
+        self.debug("successfully received data during check(): '" + str(data) + "'")
         return True
 
     def create(self):
@@ -360,8 +407,9 @@ class SimpleService(BaseService):
         Create charts
         :return: boolean
         """
-        data = self._get_data()
+        data = self._data_from_check or self._get_data()
         if data is None:
+            self.debug("failed to receive data during create().")
             return False
 
         idx = 0
@@ -385,6 +433,7 @@ class SimpleService(BaseService):
         """
         data = self._get_data()
         if data is None:
+            self.debug("failed to receive data during update().")
             return False
 
         updated = False
@@ -399,278 +448,677 @@ class SimpleService(BaseService):
                 self.end()
 
         self.commit()
+        if not updated:
+            self.error("no charts to update")
 
         return updated
+
+    @staticmethod
+    def find_binary(binary):
+        try:
+            if isinstance(binary, str):
+                binary = os.path.basename(binary)
+                return next(('/'.join([p, binary]) for p in PATH
+                            if os.path.isfile('/'.join([p, binary]))
+                            and os.access('/'.join([p, binary]), os.X_OK)))
+            return None
+        except StopIteration:
+            return None
+
+    def _add_new_dimension(self, dimension_id, chart_name, dimension=None, algorithm='incremental',
+                           multiplier=1, divisor=1, priority=65000):
+        """
+        :param dimension_id:
+        :param chart_name:
+        :param dimension:
+        :param algorithm:
+        :param multiplier:
+        :param divisor:
+        :param priority:
+        :return:
+        """
+        if not all([dimension_id not in self._dimensions,
+                    chart_name in self.order,
+                    chart_name in self.definitions]):
+            return
+        self._dimensions.append(dimension_id)
+        dimension_list = list(map(str, [dimension_id,
+                                        dimension if dimension else dimension_id,
+                                        algorithm,
+                                        multiplier,
+                                        divisor]))
+        self.definitions[chart_name]['lines'].append(dimension_list)
+        add_to_name = self.override_name or self.name
+        job_name = ('_'.join([self.__module__, re.sub('\s+', '_', add_to_name)])
+                    if add_to_name != 'None' else self.__module__)
+        chart = 'CHART {0}.{1} '.format(job_name, chart_name)
+        options = '"" "{0}" {1} "{2}" {3} {4} '.format(*self.definitions[chart_name]['options'][1:6])
+        other = '{0} {1}\n'.format(priority, self.update_every)
+        new_dimension = "DIMENSION {0}\n".format(' '.join(dimension_list))
+        print(chart + options + other + new_dimension)
 
 
 class UrlService(SimpleService):
     def __init__(self, configuration=None, name=None):
-        self.url = ""
-        self.user = None
-        self.password = None
         SimpleService.__init__(self, configuration=configuration, name=name)
+        self.url = self.configuration.get('url')
+        self.user = self.configuration.get('user')
+        self.password = self.configuration.get('pass')
+        self.ss_cert = self.configuration.get('ss_cert')
+        self.proxy = self.configuration.get('proxy')
 
-    def __add_auth(self):
-        passman = urllib2.HTTPPasswordMgrWithDefaultRealm()
-        passman.add_password(None, self.url, self.user, self.password)
-        authhandler = urllib2.HTTPBasicAuthHandler(passman)
-        opener = urllib2.build_opener(authhandler)
-        urllib2.install_opener(opener)
+    def __add_openers(self, user=None, password=None, ss_cert=None, proxy=None, url=None):
+        user = user or self.user
+        password = password or self.password
+        ss_cert = ss_cert or self.ss_cert
+        proxy = proxy or self.proxy
 
-    def _get_raw_data(self):
+        handlers = list()
+
+        # HTTP Basic Auth handler
+        if all([user, password, isinstance(user, str), isinstance(password, str)]):
+            url = url or self.url
+            url_parse = urlparse(url)
+            top_level_url = '://'.join([url_parse.scheme, url_parse.netloc])
+            passman = urllib2.HTTPPasswordMgrWithDefaultRealm()
+            passman.add_password(None, top_level_url, user, password)
+            handlers.append(urllib2.HTTPBasicAuthHandler(passman))
+            self.debug("Enabling HTTP basic auth")
+
+        # HTTPS handler
+        # Self-signed certificate ignore
+        if ss_cert:
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            except AttributeError:
+                self.error('HTTPS self-signed certificate ignore not enabled')
+            else:
+                handlers.append(urllib2.HTTPSHandler(context=ctx))
+                self.debug("Enabling HTTP self-signed certificate ignore")
+
+        # PROXY handler
+        if proxy and isinstance(proxy, str) and not ss_cert:
+            handlers.append(urllib2.ProxyHandler(dict(http=proxy)))
+            self.debug("Enabling HTTP proxy handler (%s)" % proxy)
+
+        opener = urllib2.build_opener(*handlers)
+        return opener
+
+    def _build_opener(self, **kwargs):
+        try:
+            return self.__add_openers(**kwargs)
+        except TypeError as error:
+            self.error('build_opener() error:', str(error))
+            return None
+
+    def _get_raw_data(self, url=None, opener=None):
         """
         Get raw data from http request
         :return: str
         """
-        raw = None
+        data = None
         try:
-            f = urllib2.urlopen(self.url, timeout=self.update_every)
-        except Exception as e:
-            msg.error(self.__module__, str(e))
+            opener = opener or self.opener
+            data = opener.open(url or self.url, timeout=self.update_every * 2)
+            raw_data = data.read().decode('utf-8', 'ignore')
+        except urllib2.URLError as error:
+            self.error('Url: %s. Error: %s' % (url or self.url, str(error)))
             return None
-
-        try:
-            raw = f.read().decode('utf-8')
-        except Exception as e:
-            msg.error(self.__module__, str(e))
+        except Exception as error:
+            self.error(str(error))
+            return None
         finally:
-            f.close()
-        return raw
+            if data is not None:
+                data.close()
+        return raw_data or None
 
     def check(self):
         """
         Format configuration data and try to connect to server
         :return: boolean
         """
-        if self.name is None or self.name == str(None):
-            self.name = 'local'
-            self.chart_name += "_" + self.name
-        else:
-            self.name = str(self.name)
-        try:
-            self.url = str(self.configuration['url'])
-        except (KeyError, TypeError):
-            pass
-        try:
-            self.user = str(self.configuration['user'])
-        except (KeyError, TypeError):
-            pass
-        try:
-            self.password = str(self.configuration['password'])
-        except (KeyError, TypeError):
-            pass
+        if not (self.url and isinstance(self.url, str)):
+            self.error('URL is not defined or type is not <str>')
+            return False
 
-        if self.user is not None and self.password is not None:
-            self.__add_auth()
+        self.opener = self.__add_openers()
 
-        if self._get_data() is not None:
+        try:
+            data = self._get_data()
+        except Exception as error:
+            self.error('_get_data() failed. Url: %s. Error: %s' % (self.url, error))
+            return False
+
+        if isinstance(data, dict) and data:
+            self._data_from_check = data
             return True
         else:
+            self.error("_get_data() returned no data or type is not <dict>")
             return False
 
 
 class SocketService(SimpleService):
     def __init__(self, configuration=None, name=None):
+        self._sock = None
+        self._keep_alive = False
         self.host = "localhost"
         self.port = None
-        self.sock = None
         self.unix_socket = None
         self.request = ""
+        self.__socket_config = None
+        self.__empty_request = "".encode()
         SimpleService.__init__(self, configuration=configuration, name=name)
+
+    def _socketerror(self, message=None):
+        if self.unix_socket is not None:
+            self.error("unix socket '" + self.unix_socket + "':", message)
+        else:
+            if self.__socket_config is not None:
+                af, socktype, proto, canonname, sa = self.__socket_config
+                self.error("socket to '" + str(sa[0]) + "' port " + str(sa[1]) + ":", message)
+            else:
+                self.error("unknown socket:", message)
+
+    def _connect2socket(self, res=None):
+        """
+        Connect to a socket, passing the result of getaddrinfo()
+        :return: boolean
+        """
+        if res is None:
+            res = self.__socket_config
+            if res is None:
+                self.error("Cannot create socket to 'None':")
+                return False
+
+        af, socktype, proto, canonname, sa = res
+        try:
+            self.debug("creating socket to '" + str(sa[0]) + "', port " + str(sa[1]))
+            self._sock = socket.socket(af, socktype, proto)
+        except socket.error as e:
+            self.error("Failed to create socket to '" + str(sa[0]) + "', port " + str(sa[1]) + ":", str(e))
+            self._sock = None
+            self.__socket_config = None
+            return False
+
+        try:
+            self.debug("connecting socket to '" + str(sa[0]) + "', port " + str(sa[1]))
+            self._sock.connect(sa)
+        except socket.error as e:
+            self.error("Failed to connect to '" + str(sa[0]) + "', port " + str(sa[1]) + ":", str(e))
+            self._disconnect()
+            self.__socket_config = None
+            return False
+
+        self.debug("connected to '" + str(sa[0]) + "', port " + str(sa[1]))
+        self.__socket_config = res
+        return True
+
+    def _connect2unixsocket(self):
+        """
+        Connect to a unix socket, given its filename
+        :return: boolean
+        """
+        if self.unix_socket is None:
+            self.error("cannot connect to unix socket 'None'")
+            return False
+
+        try:
+            self.debug("attempting DGRAM unix socket '" + str(self.unix_socket) + "'")
+            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            self._sock.connect(self.unix_socket)
+            self.debug("connected DGRAM unix socket '" + str(self.unix_socket) + "'")
+            return True
+        except socket.error as e:
+            self.debug("Failed to connect DGRAM unix socket '" + str(self.unix_socket) + "':", str(e))
+
+        try:
+            self.debug("attempting STREAM unix socket '" + str(self.unix_socket) + "'")
+            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._sock.connect(self.unix_socket)
+            self.debug("connected STREAM unix socket '" + str(self.unix_socket) + "'")
+            return True
+        except socket.error as e:
+            self.debug("Failed to connect STREAM unix socket '" + str(self.unix_socket) + "':", str(e))
+            self.error("Failed to connect to unix socket '" + str(self.unix_socket) + "':", str(e))
+            self._sock = None
+            return False
+
+    def _connect(self):
+        """
+        Recreate socket and connect to it since sockets cannot be reused after closing
+        Available configurations are IPv6, IPv4 or UNIX socket
+        :return:
+        """
+        try:
+            if self.unix_socket is not None:
+                self._connect2unixsocket()
+
+            else:
+                if self.__socket_config is not None:
+                    self._connect2socket()
+                else:
+                    for res in socket.getaddrinfo(self.host, self.port, socket.AF_UNSPEC, socket.SOCK_STREAM):
+                        if self._connect2socket(res): break
+
+        except Exception as e:
+            self._sock = None
+            self.__socket_config = None
+
+        if self._sock is not None:
+            self._sock.setblocking(0)
+            self._sock.settimeout(5)
+            self.debug("set socket timeout to: " + str(self._sock.gettimeout()))
+
+    def _disconnect(self):
+        """
+        Close socket connection
+        :return:
+        """
+        if self._sock is not None:
+            try:
+                self.debug("closing socket")
+                self._sock.shutdown(2)  # 0 - read, 1 - write, 2 - all
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    def _send(self):
+        """
+        Send request.
+        :return: boolean
+        """
+        # Send request if it is needed
+        if self.request != self.__empty_request:
+            try:
+                self.debug("sending request:", str(self.request))
+                self._sock.send(self.request)
+            except Exception as e:
+                self._socketerror("error sending request:" + str(e))
+                self._disconnect()
+                return False
+        return True
+
+    def _receive(self):
+        """
+        Receive data from socket
+        :return: str
+        """
+        data = ""
+        while True:
+            self.debug("receiving response")
+            try:
+                buf = self._sock.recv(4096)
+            except Exception as e:
+                self._socketerror("failed to receive response:" + str(e))
+                self._disconnect()
+                break
+
+            if buf is None or len(buf) == 0:  # handle server disconnect
+                if data == "":
+                    self._socketerror("unexpectedly disconnected")
+                else:
+                    self.debug("server closed the connection")
+                self._disconnect()
+                break
+
+            self.debug("received data:", str(buf))
+            data += buf.decode('utf-8', 'ignore')
+            if self._check_raw_data(data):
+                break
+
+        self.debug("final response:", str(data))
+        return data
 
     def _get_raw_data(self):
         """
         Get raw data with low-level "socket" module.
         :return: str
         """
-        if self.sock is None:
-            try:
-                if self.unix_socket is None:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    #sock.settimeout(self.update_every)
-                    sock.connect((self.host, self.port))
-                else:
-                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-                    #sock.settimeout(self.update_every)
-                    sock.connect(self.unix_socket)
-
-            except Exception as e:
-                self.error(e)
-                self.sock = None
+        if self._sock is None:
+            self._connect()
+            if self._sock is None:
                 return None
 
-        if self.request != "".encode():
-            try:
-                sock.send(self.request)
-            except Exception:
-                try:
-                    sock.shutdown(1)
-                    sock.close()
-                except:
-                    pass
-                self.sock = None
-                return None
-
-        data = sock.recv(2)
-        try:
-            while True:
-                try:
-                    buf = sock.recv(1024, 0x40)  # get 1024 bytes in NON-BLOCKING mode
-                except socket.error:
-                    break
-
-                if len(buf) == 0:
-                    break
-                else:
-                    data += buf
-        except:
-            sock.close()
+        # Send request if it is needed
+        if not self._send():
             return None
 
-        return data.decode()
+        data = self._receive()
+
+        if not self._keep_alive:
+            self._disconnect()
+
+        return data
+
+    def _check_raw_data(self, data):
+        """
+        Check if all data has been gathered from socket
+        :param data: str
+        :return: boolean
+        """
+        return True
 
     def _parse_config(self):
         """
         Parse configuration data
         :return: boolean
         """
-        if self.name is not None or self.name != str(None):
+        if self.name is None or self.name == str(None):
             self.name = ""
         else:
             self.name = str(self.name)
+
         try:
             self.unix_socket = str(self.configuration['socket'])
         except (KeyError, TypeError):
-            self.error("No unix socket specified. Trying TCP/IP socket.")
+            self.debug("No unix socket specified. Trying TCP/IP socket.")
+            self.unix_socket = None
             try:
                 self.host = str(self.configuration['host'])
             except (KeyError, TypeError):
-                self.error("No host specified. Using: '" + self.host + "'")
+                self.debug("No host specified. Using: '" + self.host + "'")
             try:
                 self.port = int(self.configuration['port'])
             except (KeyError, TypeError):
-                self.error("No port specified. Using: '" + str(self.port) + "'")
+                self.debug("No port specified. Using: '" + str(self.port) + "'")
+
         try:
             self.request = str(self.configuration['request'])
         except (KeyError, TypeError):
-            self.error("No request specified. Using: '" + str(self.request) + "'")
+            self.debug("No request specified. Using: '" + str(self.request) + "'")
+
         self.request = self.request.encode()
+
+    def check(self):
+        self._parse_config()
+        return SimpleService.check(self)
 
 
 class LogService(SimpleService):
     def __init__(self, configuration=None, name=None):
-        self.log_path = ""
-        self._last_position = 0
-        # self._log_reader = None
         SimpleService.__init__(self, configuration=configuration, name=name)
+        self.log_path = self.configuration.get('path')
+        self.__glob_path = self.log_path
+        self._last_position = 0
         self.retries = 100000  # basically always retry
+        self.__re_find = dict(current=0, run=0, maximum=60)
 
     def _get_raw_data(self):
         """
         Get log lines since last poll
         :return: list
         """
-        lines = []
+        lines = list()
         try:
-            if os.path.getsize(self.log_path) < self._last_position:
-                self._last_position = 0
-            elif os.path.getsize(self.log_path) == self._last_position:
-                return None
-            with open(self.log_path, "r") as fp:
+            if self.__re_find['current'] == self.__re_find['run']:
+                self._find_recent_log_file()
+            size = os.path.getsize(self.log_path)
+            if size == self._last_position:
+                self.__re_find['current'] += 1
+                return list()  # return empty list if nothing has changed
+            elif size < self._last_position:
+                self._last_position = 0  # read from beginning if file has shrunk
+
+            with open(self.log_path) as fp:
                 fp.seek(self._last_position)
-                for i, line in enumerate(fp):
+                for line in fp:
                     lines.append(line)
                 self._last_position = fp.tell()
-        except Exception as e:
-            self.error(self.__module__, str(e))
+                self.__re_find['current'] = 0
+        except (OSError, IOError) as error:
+            self.__re_find['current'] += 1
+            self.error(str(error))
 
-        if len(lines) != 0:
-            return lines
-        return None
+        return lines or None
+
+    def _find_recent_log_file(self):
+        """
+        :return:
+        """
+        self.__re_find['run'] = self.__re_find['maximum']
+        self.__re_find['current'] = 0
+        self.__glob_path = self.__glob_path or self.log_path  # workaround for modules w/o config files
+        path_list = glob(self.__glob_path)
+        if path_list:
+            self.log_path = max(path_list)
+            return True
+        return False
 
     def check(self):
         """
         Parse basic configuration and check if log file exists
         :return: boolean
         """
-        if self.name is not None or self.name != str(None):
-            self.name = ""
-        else:
-            self.name = str(self.name)
-        try:
-            self.log_path = str(self.configuration['path'])
-        except (KeyError, TypeError):
-            self.error("No path to log specified. Using: '" + self.log_path + "'")
+        if not self.log_path:
+            self.error("No path to log specified")
+            return None
 
-        if os.access(self.log_path, os.R_OK):
+        if all([self._find_recent_log_file(),
+                os.access(self.log_path, os.R_OK),
+                os.path.isfile(self.log_path)]):
             return True
-        else:
-            self.error("Cannot access file: '" + self.log_path + "'")
-            return False
+        self.error("Cannot access %s" % self.log_path)
+        return False
 
     def create(self):
+        # set cursor at last byte of log file
+        self._last_position = os.path.getsize(self.log_path)
         status = SimpleService.create(self)
-        self._last_position = 0
+        # self._last_position = 0
         return status
 
 
 class ExecutableService(SimpleService):
-    command_whitelist = ['exim', 'postqueue']
-    bad_substrings = ('&', '|', ';', '>', '<')
 
     def __init__(self, configuration=None, name=None):
-        self.command = ""
         SimpleService.__init__(self, configuration=configuration, name=name)
+        self.command = None
 
-    def _get_raw_data(self):
+    def _get_raw_data(self, stderr=False):
         """
         Get raw data from executed command
-        :return: str
+        :return: <list>
         """
         try:
             p = Popen(self.command, stdout=PIPE, stderr=PIPE)
-        except Exception as e:
-            self.error(self.__module__, str(e))
+        except Exception as error:
+            self.error("Executing command", " ".join(self.command), "resulted in error:", str(error))
             return None
-        data = []
-        for line in p.stdout.readlines():
-            data.append(str(line.decode()))
+        data = list()
+        std = p.stderr if stderr else p.stdout
+        for line in std.readlines():
+            data.append(line.decode())
 
-        return data
+        return data or None
 
     def check(self):
         """
         Parse basic configuration, check if command is whitelisted and is returning values
-        :return: boolean
+        :return: <boolean>
         """
-        if self.name is not None or self.name != str(None):
-            self.name = ""
-        else:
-            self.name = str(self.name)
-        # try:
-        #     self.command = str(self.configuration['path'])
-        # except (KeyError, TypeError):
-        #     self.error("No command specified. Using: '" + self.command + "'")
-        self.command = self.command.split(' ')
-        if self.command[0] not in self.command_whitelist:
-            self.error("Command is not whitelisted.")
+        # Preference: 1. "command" from configuration file 2. "command" from plugin (if specified)
+        if 'command' in self.configuration:
+            self.command = self.configuration['command']
+
+        # "command" must be: 1.not None 2. type <str>
+        if not (self.command and isinstance(self.command, str)):
+            self.error('Command is not defined or command type is not <str>')
             return False
 
-        for arg in self.command[1:]:
-            if any(st in arg for st in self.bad_substrings):
-                self.error("Bad command argument:" + " ".join(self.command[1:]))
+        # Split "command" into: 1. command <str> 2. options <list>
+        command, opts = self.command.split()[0], self.command.split()[1:]
+
+        # Check for "bad" symbols in options. No pipes, redirects etc. TODO: what is missing?
+        bad_opts = set(''.join(opts)) & set(['&', '|', ';', '>', '<'])
+        if bad_opts:
+            self.error("Bad command argument(s): %s" % bad_opts)
+            return False
+
+        # Find absolute path ('echo' => '/bin/echo')
+        if '/' not in command:
+            command = self.find_binary(command)
+            if not command:
+                self.error('Can\'t locate "%s" binary in PATH(%s)' % (self.command, PATH))
                 return False
-        # test command and search for it in /usr/sbin or /sbin when failed
-        base = self.command[0]
-        if self._get_raw_data() is None:
-            for prefix in ['/sbin/', '/usr/sbin/']:
-                self.command[0] = prefix + base
-                if os.path.isfile(self.command[0]):
-                    break
-                #if self._get_raw_data() is not None:
-                #    break
+        # Check if binary exist and executable
+        else:
+            if not (os.path.isfile(command) and os.access(command, os.X_OK)):
+                self.error('"%s" is not a file or not executable' % command)
+                return False
 
-        if self._get_data() is None or len(self._get_data()) == 0:
+        self.command = [command] + opts if opts else [command]
+
+        try:
+            data = self._get_data()
+        except Exception as error:
+            self.error('_get_data() failed. Command: %s. Error: %s' % (self.command, error))
             return False
-        return True
+
+        if isinstance(data, dict) and data:
+            # We need this for create() method. No reason to execute get_data() again if result is not empty dict()
+            self._data_from_check = data
+            return True
+        else:
+            self.error("Command", str(self.command), "returned no data")
+            return False
+
+
+class MySQLService(SimpleService):
+
+    def __init__(self, configuration=None, name=None):
+        SimpleService.__init__(self, configuration=configuration, name=name)
+        self.__connection = None
+        self.__conn_properties = dict()
+        self.extra_conn_properties = dict()
+        self.__queries = self.configuration.get('queries', dict())
+        self.queries = dict()
+
+    def __connect(self):
+        try:
+            connection = MySQLdb.connect(connect_timeout=self.update_every, **self.__conn_properties)
+        except (MySQLdb.MySQLError, TypeError, AttributeError) as error:
+            return None, str(error)
+        else:
+            return connection, None
+
+    def check(self):
+        def get_connection_properties(conf, extra_conf):
+            properties = dict()
+            if 'user' in conf and conf['user']:
+                properties['user'] = conf['user']
+            if 'pass' in conf and conf['pass']:
+                properties['passwd'] = conf['pass']
+            if 'socket' in conf and conf['socket']:
+                properties['unix_socket'] = conf['socket']
+            elif 'host' in conf and conf['host']:
+                properties['host'] = conf['host']
+                properties['port'] = int(conf.get('port', 3306))
+            elif 'my.cnf' in conf and conf['my.cnf']:
+                properties['read_default_file'] = conf['my.cnf']
+            if isinstance(extra_conf, dict) and extra_conf:
+                properties.update(extra_conf)
+
+            return properties or None
+
+        def is_valid_queries_dict(raw_queries, log_error):
+            """
+            :param raw_queries: dict:
+            :param log_error: function:
+            :return: dict or None
+
+            raw_queries is valid when: type <dict> and not empty after is_valid_query(for all queries)
+            """
+            def is_valid_query(query):
+                return all([isinstance(query, str),
+                            query.startswith(('SELECT', 'select', 'SHOW', 'show'))])
+
+            if hasattr(raw_queries, 'keys') and raw_queries:
+                valid_queries = dict([(n, q) for n, q in raw_queries.items() if is_valid_query(q)])
+                bad_queries = set(raw_queries) - set(valid_queries)
+
+                if bad_queries:
+                    log_error('Removed query(s): %s' % bad_queries)
+                return valid_queries
+            else:
+                log_error('Unsupported "queries" format. Must be not empty <dict>')
+                return None
+
+        if not PYMYSQL:
+            self.error('MySQLdb or PyMySQL module is needed to use mysql.chart.py plugin')
+            return False
+
+        # Preference: 1. "queries" from the configuration file 2. "queries" from the module
+        self.queries = self.__queries or self.queries
+        # Check if "self.queries" exist, not empty and all queries are in valid format
+        self.queries = is_valid_queries_dict(self.queries, self.error)
+        if not self.queries:
+            return None
+
+        # Get connection properties
+        self.__conn_properties = get_connection_properties(self.configuration, self.extra_conn_properties)
+        if not self.__conn_properties:
+            self.error('Connection properties are missing')
+            return False
+
+        # Create connection to the database
+        self.__connection, error = self.__connect()
+        if error:
+            self.error('Can\'t establish connection to MySQL: %s' % error)
+            return False
+
+        try:
+            data = self._get_data() 
+        except Exception as error:
+            self.error('_get_data() failed. Error: %s' % error)
+            return False
+
+        if isinstance(data, dict) and data:
+            # We need this for create() method
+            self._data_from_check = data
+            return True
+        else:
+            self.error("_get_data() returned no data or type is not <dict>")
+            return False
+    
+    def _get_raw_data(self, description=None):
+        """
+        Get raw data from MySQL server
+        :return: dict: fetchall() or (fetchall(), description)
+        """
+
+        if not self.__connection:
+            self.__connection, error = self.__connect()
+            if error:
+                return None
+
+        raw_data = dict()
+        queries = dict(self.queries)
+        try:
+            with self.__connection as cursor:
+                for name, query in queries.items():
+                    try:
+                        cursor.execute(query)
+                    except (MySQLdb.ProgrammingError, MySQLdb.OperationalError) as error:
+                        if self.__is_error_critical(err_class=exc_info()[0], err_text=str(error)):
+                            raise RuntimeError
+                        self.error('Removed query: %s[%s]. Error: %s'
+                                   % (name, query, error))
+                        self.queries.pop(name)
+                        continue
+                    else:
+                        raw_data[name] = (cursor.fetchall(), cursor.description) if description else cursor.fetchall()
+            self.__connection.commit()
+        except (MySQLdb.MySQLError, RuntimeError, TypeError, AttributeError):
+            self.__connection.close()
+            self.__connection = None
+            return None
+        else:
+            return raw_data or None
+
+    @staticmethod
+    def __is_error_critical(err_class, err_text):
+        return err_class == MySQLdb.OperationalError and all(['denied' not in err_text,
+                                                              'Unknown column' not in err_text])
