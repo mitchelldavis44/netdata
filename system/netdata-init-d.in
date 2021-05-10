@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 #
 # netdata	Real-time performance monitoring, done right
 # chkconfig: 345 99 01
@@ -13,9 +14,10 @@
 
 DAEMON="netdata"
 DAEMON_PATH=@sbindir_POST@
-PIDFILE=@localstatedir_POST@/run/$DAEMON.pid
+PIDFILE_PATH=@localstatedir_POST@/run/netdata
+PIDFILE=$PIDFILE_PATH/$DAEMON.pid
 DAEMONOPTS="-P $PIDFILE"
-STOP_TIMEOUT="10"
+STOP_TIMEOUT="60"
 
 [ -e /etc/sysconfig/$DAEMON ] && . /etc/sysconfig/$DAEMON
 
@@ -24,6 +26,7 @@ LOCKFILE=/var/lock/subsys/$DAEMON
 service_start()
 {
 	[ -x $DAEMON_PATH ] || exit 5
+	[ ! -d $PIDFILE_PATH ] && mkdir -p $PIDFILE_PATH
 	echo -n "Starting $DAEMON..."
 	daemon $DAEMON_PATH/$DAEMON $DAEMONOPTS
 	RETVAL=$?

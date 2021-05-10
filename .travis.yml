@@ -1,67 +1,210 @@
-dist: trusty
-sudo: true
-#
-# C includes autotools and make by default
+---
+dist: focal
 language: c
-services:
-  - docker
-os:
-  - linux
-  - osx
-compiler:
- - gcc
- - clang
-#
-# Extra packages
+
 addons:
   apt:
-    packages:
-    - gnupg
-    - libcap2-bin
-    - zlib1g-dev
-    - uuid-dev
-    - fakeroot
-#
-# Setup environment
+    packages: ['moreutils']
+
+env:
+  global:
+    - RELEASE_CHANNEL=nightly
+
 before_install:
- - eval "$(ssh-agent -s)"
- - ./.travis/decrypt-if-have-key decb6f6387c4
- - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then brew update ; fi
- - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then brew uninstall gnupg || echo; brew install gpg; fi
- - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then brew install fakeroot; fi
- - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then brew install ossp-uuid; fi
- - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then brew install xz; fi
+  - exec > >(ts -s '%H:%M:%.S ') 2>&1
+  - source .travis/utils.sh
+
+# Install dependencies for all, once
 #
-# Run
-before_script:
- - gpg --import packaging/gpg.keys
- # Run the commit hooks in case the developer didn't
- - git diff 4b825dc642cb6eb9a060e54bf8d69288fbee4904 | ./packaging/check-files -
-script:
-   # make release packages
- - fakeroot ./packaging/git-build
-   # make self-extractor
- - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then ./makeself/build-x86_64-static.sh; fi
-   # test build and installer
- - fakeroot ./netdata-installer.sh --install $HOME --dont-wait --dont-start-it
+install:
+  - sudo apt-get install -y libuv1-dev liblz4-dev libjudy-dev libcap2-bin zlib1g-dev uuid-dev fakeroot libipmimonitoring-dev libmnl-dev libnetfilter-acct-dev gnupg python3-pip
+  - sudo pip install git-semver==0.3.2 # 11/Sep/2019: git-semver tip was broken, so we had to force last good run of it
+  - source tests/installer/slack.sh
+  - export NOTIF_CHANNEL="automation-beta"
+  - if [ "${TRAVIS_REPO_SLUG}" = "netdata/netdata" ]; then export NOTIF_CHANNEL="automation"; fi;
+  - export BUILD_VERSION="$(cat packaging/version | cut -d'-' -f1)"
+  - export LATEST_RELEASE_VERSION="$(cat packaging/version | cut -d'-' -f1)"
+  - export LATEST_RELEASE_DATE="$(git log -1 --format=%aD "${LATEST_RELEASE_VERSION}" | cat)"
+  - if [[ "${TRAVIS_COMMIT_MESSAGE}" = *"[Build latest]"* ]]; then export BUILD_VERSION="$(cat packaging/version | cut -d'-' -f1,2 | sed -e 's/-/./g').latest"; fi;
+  - export DEPLOY_REPO="netdata"  # Default production packaging repository
+  - export PACKAGING_USER="netdata" # Standard package cloud account
+  - if [[ "${TRAVIS_COMMIT_MESSAGE}" = *"[Build latest]"* ]]; then export DEPLOY_REPO="netdata-edge"; fi;
+  - export PACKAGE_CLOUD_RETENTION_DAYS=30
+  - if [ ! "${TRAVIS_REPO_SLUG}" = "netdata/netdata" ]; then export DEPLOY_REPO="netdata-devel";  fi;
+  # These are release-related artifacts and have to be evaluated before we start doing conditional checks inside stages
+  - source ".travis/tagger.sh"
+  - export GIT_TAG="$(git tag --points-at)"
+  - git submodule update --init --recursive
+
+
+# Setup notification system
 #
-# Deploy as required
-after_success:
-  - for i in *.tar.*; do md5sum -b $i > $i.md5; sha512sum -b $i > $i.sha; done
-  - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then for i in *.gz.run; do md5sum -b $i > $i.md5; sha512sum -b $i > $i.sha; done; fi
-  - ./.travis/deploy-if-have-key
-deploy:
-  # Upload results to GitHub (tag only)
-  - provider: releases
-    draft: true
-    api_key:
-      secure: invJ0ZdNOPi9x8JJmFkqSIQMxljkLROwgRFCbmXMausJ0rA4E/PgLtM7ddWrHlu6lu8N9e5Pus4bG8DWATHbY0blMUhL5C82S5KK4mxAANLCLgTV8Qr7dMWnMqRV/OJBMGM1ZWpC2AA5GVhPLF7Z++54iqK+LM8P0EuOTAKbebIWCIkGybbSpXj+jJqaQXY0tLGSn5fXPFfyV3Tw0URJPcO3Uz5iukELngkLVSve2d0XYwy8M5tpLKHJi5bzc9CwcJZ/JK1WvklqmV3fNdSSzZunaAfDwWosV3hO7QcGnAVEbNl0HBKZJ8JkriV2fDbH4fttoSvLO2tW9HauP7Yf5XqLDudqUj4gPTuGzd31vRb9kx9cAulfE9onMAmDbjbne8Cp2Bq9/yBEqaofqEIaRcLgnlZSNc+PWbH4FQJ6fIOs5nfqLJo0G+3isgRWrqxp/rjILOvbIGbfLkbPl9aV09IvzShyW2lK7E+QOP0TZIwyXGT0NW0Rr/eyzuMXooy8wi9NehKfrxIcUr7784nU2E+EtItrhtTkJpK8XBBh16swn7s2sQ89qx9PYd/wE5qnKfG0yy3SSc2ycKzEpH7Cy3E6lC4Jytw0AM1Mc179WASBhlR2tyElkRcuhlqOFlJ/6iXjp3kqSgW4kvWbwHwT6VsyiDRhf+Ir4XILFBJ26Z8=
-    skip_cleanup: true
-    file_glob: true
-    file:
-      - "netdata*.tar.*"
-      - "netdata*.gz.run*"
-    on:
-      condition: $CC = gcc && $TRAVIS_OS_NAME = linux
-      repo: firehol/netdata
-      tags: true
+notifications:
+  webhooks:
+    urls:
+      - https://app.fossa.io/hooks/travisci
+
+# Define the stage sequence and conditionals
+#
+stages:
+  # Mandatory runs, we always want these executed
+  - name: Build process
+    if: commit_message =~ /^((?!\[Package (amd64|arm64|i386) (DEB|RPM)( .*)?\]).)*$/
+
+    # Nightly operations
+  - name: Nightly operations
+    if: branch = master AND type = cron AND env(RUN_NIGHTLY) = yes
+
+  - name: Nightly release
+    if: branch = master AND type = cron AND env(RUN_NIGHTLY) = yes
+
+    # Scheduled releases
+  - name: Support activities on main branch
+    if: branch = master AND type != pull_request AND type != cron AND repo = netdata/netdata
+
+    # We don't run on release candidates
+  - name: Publish for release
+    if: >-
+      branch = master
+      AND type != pull_request
+      AND type != cron
+      AND tag !~ /(-rc)/
+      AND commit_message =~ /\[netdata (release candidate|(major|minor|patch) release)\]/
+
+
+# Define stage implementation details
+#
+jobs:
+  # This is a hook to help us introduce "soft" errors on our process
+  allow_failures:
+    - env: ALLOW_SOFT_FAILURE_HERE=true
+  include:
+      # Ensure netdata code builds successfully
+    - stage: Build process
+
+      name: Standard netdata build
+      script: fakeroot ./netdata-installer.sh --install $HOME --dont-wait --dont-start-it --enable-plugin-nfacct --enable-plugin-freeipmi --disable-lto
+      env: CFLAGS='-O1 -Wall -Wextra -Wformat-signedness -fstack-protector-all -fno-common   -DNETDATA_INTERNAL_CHECKS=1 -D_FORTIFY_SOURCE=2 -DNETDATA_VERIFY_LOCKS=1'
+      after_failure: post_message "TRAVIS_MESSAGE" "<!here> standard netdata build is failing (Still dont know which one, will improve soon)"
+
+    - stage: Support activities on main branch
+      name: Generate changelog for release (only on special and tagged commit msg)
+      before_script: post_message "TRAVIS_MESSAGE" "Support activities on main branch initiated" "${NOTIF_CHANNEL}"
+      script:
+        - echo "GIT Branch:" && git branch
+        - echo "Last commit:" && git log -1
+        - echo "GIT Describe:" && git describe
+        - echo "packaging/version:" && cat packaging/version
+        - if [[ -z "${GIT_TAG}" ]]; then  echo "Running set tag for release" && set_tag_for_release; fi;
+        - .travis/generate_changelog_and_tag_release.sh
+      after_failure: post_message "TRAVIS_MESSAGE" "<!here> Changelog generation and tag of release, failed"
+      git:
+        depth: false
+      if: commit_message =~ /\[netdata (release candidate|(major|minor|patch) release)\]/ AND tag !~ /(-rc)/ OR (env(GIT_TAG) IS present AND NOT env(GIT_TAG) IS blank)
+
+    # We only publish if a TAG has been set during packaging
+    - stage: Publish for release
+      name: Create release draft
+      git:
+        depth: false
+      env:
+        - RELEASE_CHANNEL=stable
+      before_script: post_message "TRAVIS_MESSAGE" "Drafting release on github" "${NOTIF_CHANNEL}"
+      script:
+        - echo "GIT Branch:" && git branch
+        - echo "Last commit:" && git log -1
+        - echo "GIT Describe:" && git describe
+        - echo "packaging/version:" && cat packaging/version
+        - echo "Generating release artifacts" && .travis/create_artifacts.sh  # Could/should be a common storage to put this and share between jobs
+        - .travis/draft_release.sh
+      after_failure: post_message "TRAVIS_MESSAGE" "<!here> Draft release submission failed"
+
+    - name: Trigger Docker image build and publish
+      script:
+        - git checkout "${TRAVIS_BRANCH}" && export BUILD_VERSION="$(cat packaging/version | cut -d'-' -f1)"
+        - .travis/trigger_docker_build.sh "${GITHUB_TOKEN}" "${BUILD_VERSION}"
+      after_failure: post_message "TRAVIS_MESSAGE" "<!here> Failed to trigger docker build during release" "${NOTIF_CHANNEL}"
+
+    - name: Trigger DEB and RPM package build
+      script:
+        - git checkout "${TRAVIS_BRANCH}" && export BUILD_VERSION="$(cat packaging/version | sed 's/^v//' | cut -d'-' -f1)"
+        - .travis/trigger_package_build.sh "${GITHUB_TOKEN}" "${BUILD_VERSION}" "release"
+      after_failure: post_message "TRAVIS_MESSAGE" "<!here> Failed to trigger deb and rpm package build during release" "${NOTIF_CHANNEL}"
+
+
+    # This is the nightly pre-execution step (Jobs, preparatory steps for nightly, etc)
+    - stage: Nightly operations
+      name: Kickstart files integrity testing (extended)
+      script: ./tests/installer/checksums.sh
+
+      # This is generating the changelog for nightly release and publish it
+    - name: Generate nightly changelog
+      script:
+        - ".travis/nightlies.sh"
+        - ".travis/check_changelog_last_modification.sh"
+      after_failure: post_message "TRAVIS_MESSAGE" "<!here> Nightly changelog generation failed"
+      git:
+        depth: false
+
+    # This is the nightly execution step
+    #
+    - stage: Nightly release
+      name: Create nightly release artifacts, publish to GCS
+      script:
+        - echo "GIT Branch:" && git branch
+        - echo "Last commit:" && git log -1
+        - echo "GIT Describe:" && git describe
+        - echo "packaging/version:" && cat packaging/version
+        - .travis/create_artifacts.sh
+      after_failure: post_message "TRAVIS_MESSAGE" "<!here> Nightly artifacts generation failed"
+      git:
+        depth: false
+      before_deploy:
+        echo "Preparing creds under ${TRAVIS_REPO_SLUG}";
+        if [ "${TRAVIS_REPO_SLUG}" == "netdata/netdata" ]; then
+           openssl aes-256-cbc -K $encrypted_8daf19481253_key -iv $encrypted_8daf19481253_iv -in .travis/gcs-credentials.json.enc -out .travis/gcs-credentials.json -d;
+        else
+           echo "Beta deployment stage in progress";
+           openssl aes-256-cbc -K $encrypted_8daf19481253_key -iv $encrypted_8daf19481253_iv -in .travis/gcs-credentials.json.enc -out .travis/gcs-credentials.json -d;
+        fi;
+      deploy:
+        # Beta storage, used for testing purposes
+        - provider: gcs
+          edge:
+            branch: gcs-ng
+          project_id: netdata-storage
+          credentials: .travis/gcs-credentials.json
+          bucket: "netdata-dev-nightlies"
+          skip_cleanup: true
+          local_dir: "artifacts"
+          on:
+            # Only deploy on netdata/netdata, master branch, when artifacts directory is created
+            repo: ${TRAVIS_REPO_SLUG}
+            branch: master
+            condition: -d "artifacts" && ${TRAVIS_REPO_SLUG} != "netdata/netdata"
+
+        # Production storage
+        - provider: gcs
+          edge:
+            branch: gcs-ng
+          project_id: netdata-storage
+          credentials: .travis/gcs-credentials.json
+          bucket: "netdata-nightlies"
+          skip_cleanup: true
+          local_dir: "artifacts"
+          on:
+            # Only deploy on netdata/netdata, master branch, when artifacts directory is created
+            repo: netdata/netdata
+            branch: master
+            condition: -d "artifacts" && ${TRAVIS_REPO_SLUG} = "netdata/netdata"
+      after_deploy: rm -f .travis/gcs-credentials.json
+
+    - name: Trigger Docker image build and publish
+      script: .travis/trigger_docker_build.sh "${GITHUB_TOKEN}" "nightly"
+      after_failure: post_message "TRAVIS_MESSAGE" "<!here> Failed to trigger docker build during nightly release" "${NOTIF_CHANNEL}"
+
+    - name: Trigger DEB and RPM package build
+      script:
+        - git checkout "${TRAVIS_BRANCH}" && export BUILD_VERSION="$(cat packaging/version | sed 's/^v//')"
+        - .travis/trigger_package_build.sh "${GITHUB_TOKEN}" "${BUILD_VERSION}" "nightly"
+      after_failure: post_message "TRAVIS_MESSAGE" "<!here> Failed to trigger deb and rpm package build during nightly release" "${NOTIF_CHANNEL}"
